@@ -1,0 +1,154 @@
+-- Anti-AFK by Proroo (hi-tech GUI)
+-- Вставьте этот скрипт в LocalScript внутри StarterGui или запустите через исполнитель.
+
+local player = game.Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+-- ============= НАСТРОЙКИ =============
+local MOVE_INTERVAL = 30          -- секунд между движениями
+local MOVE_DISTANCE = 0.3         -- студа в случайном направлении
+local ENABLED = true              -- активно при запуске
+-- =====================================
+
+-- Создаём GUI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ProrooAFK_GUI"
+screenGui.Parent = (player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui"))
+screenGui.ResetOnSpawn = false
+
+-- Главная панель (hi-tech рамка)
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 260, 0, 80)
+mainFrame.Position = UDim2.new(0.5, -130, 0.8, 0)  -- чуть выше центра снизу
+mainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 25)  -- тёмно-синий/чёрный
+mainFrame.BackgroundTransparency = 0.3
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+-- Неоновая граница
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 2.5
+stroke.Color = Color3.fromRGB(0, 220, 255)  -- голубой неон
+stroke.Transparency = 0.2
+stroke.Parent = mainFrame
+
+-- Закругление углов
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 12)
+corner.Parent = mainFrame
+
+-- Внутренний полупрозрачный слой (эффект стекла)
+local glass = Instance.new("Frame")
+glass.Size = UDim2.new(1, -6, 1, -6)
+glass.Position = UDim2.new(0, 3, 0, 3)
+glass.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+glass.BackgroundTransparency = 0.9
+glass.BorderSizePixel = 0
+glass.Parent = mainFrame
+
+local glassCorner = Instance.new("UICorner")
+glassCorner.CornerRadius = UDim.new(0, 10)
+glassCorner.Parent = glass
+
+-- Иконка-индикатор (мигающий круг)
+local indicator = Instance.new("Frame")
+indicator.Size = UDim2.new(0, 12, 0, 12)
+indicator.Position = UDim2.new(0, 15, 0, 15)
+indicator.BackgroundColor3 = Color3.fromRGB(0, 255, 180)
+indicator.BorderSizePixel = 0
+indicator.BackgroundTransparency = 0.3
+indicator.Parent = mainFrame
+
+local indicatorCorner = Instance.new("UICorner")
+indicatorCorner.CornerRadius = UDim.new(0.5, 0)
+indicatorCorner.Parent = indicator
+
+-- Текст статуса
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -40, 0, 30)
+statusLabel.Position = UDim2.new(0, 35, 0, 8)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "ANTI-AFK ACTIVE"
+statusLabel.TextColor3 = Color3.fromRGB(220, 240, 255)
+statusLabel.Font = Enum.Font.Code  -- моноширинный шрифт для hi-tech стиля
+statusLabel.TextSize = 16
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = mainFrame
+
+-- Подпись "by Proroo"
+local byLabel = Instance.new("TextLabel")
+byLabel.Size = UDim2.new(1, -40, 0, 16)
+byLabel.Position = UDim2.new(0, 35, 0, 36)
+byLabel.BackgroundTransparency = 1
+byLabel.Text = "v1.0  |  by Proroo"
+byLabel.TextColor3 = Color3.fromRGB(160, 160, 200)
+byLabel.Font = Enum.Font.Code
+byLabel.TextSize = 10
+byLabel.TextXAlignment = Enum.TextXAlignment.Left
+byLabel.Parent = mainFrame
+
+-- Кнопка выключения (маленький крестик)
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 20, 0, 20)
+closeBtn.Position = UDim2.new(1, -25, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+closeBtn.BackgroundTransparency = 0.5
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.Parent = mainFrame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 6)
+closeCorner.Parent = closeBtn
+
+-- Фоновый пульсирующий эффект индикатора
+local pulseTween = TweenService:Create(indicator, 
+    TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
+    {BackgroundTransparency = 0.7}
+)
+pulseTween:Play()
+
+-- ============= ЛОГИКА АНТИ-АФК =============
+local enabled = ENABLED
+local lastMove = 0
+
+local function antiAFK(deltaTime)
+    if not enabled then return end
+    lastMove += deltaTime
+    if lastMove < MOVE_INTERVAL then return end
+    lastMove = 0
+
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- Случайное направление по X и Z
+    local angle = math.rad(math.random() * 360)
+    local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * MOVE_DISTANCE
+    hrp.CFrame += offset
+end
+
+RunService.Heartbeat:Connect(antiAFK)
+
+-- ============= КНОПКА ЗАКРЫТИЯ =============
+closeBtn.MouseButton1Click:Connect(function()
+    enabled = false
+    statusLabel.Text = "ANTI-AFK DISABLED"
+    statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    indicator.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    pulseTween:Pause()
+    task.wait(2)
+    screenGui:Destroy()
+end)
+
+-- ============= ПЕРЕТАСКИВАНИЕ (дополнительно, уже Draggable=true) =============
+-- Но Draggable иногда конфликтует с кнопкой, поэтому ничего не меняем.
+
+print("Anti-AFK by Proroo активирован. GUI доступен.")
