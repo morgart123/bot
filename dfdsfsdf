@@ -1,0 +1,462 @@
+-- AutoBountyReset (гивер только на себя + платформа)
+local cloneref = cloneref or function(...) return ... end
+
+-- Проверка PlaceId (Slap Battles)
+local sbPlaceIds = {
+    [6403373529] = true,
+    [11520107397] = true,
+    [124596094333302] = true,
+    [9015014224] = true,
+}
+if not sbPlaceIds[game.PlaceId] then
+    local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
+    local gameName = MarketplaceService:GetProductInfo(game.PlaceId).Name or "Unknown Game"
+    print("This script is for Slap Battles, but you are in " .. gameName)
+    return
+end
+
+if getgenv().AutoBountyReset_Loaded then return end
+pcall(function() getgenv().AutoBountyReset_Loaded = true end)
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local CoreGui = cloneref(game:GetService("CoreGui"))
+local StarterGui = cloneref(game:GetService("StarterGui"))
+local Players = cloneref(game:GetService("Players"))
+local LocalPlayer = cloneref(Players.LocalPlayer)
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local Workspace = cloneref(game:GetService("Workspace"))
+local guiParent = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or CoreGui
+
+-- Glove -> Remote mapping
+local gloveHitsList = {
+    ['All'] = 'GeneralHit', ['Default'] = 'b', ['Extended'] = 'b',
+    ['ZZZZZZZ'] = 'ZZZZZZZHit', ['Brick'] = 'BrickHit', ['Snow'] = 'SnowHit',
+    ['Pull'] = 'PullHit', ['Flash'] = 'FlashHit', ['Spring'] = 'springhit',
+    ['Swapper'] = 'HitSwapper', ['Bull'] = 'BullHit', ['Dice'] = 'DiceHit',
+    ['Ghost'] = 'GhostHit', ['Stun'] = 'HtStun', ['Za Hando'] = 'zhramt',
+    ['Fort'] = 'Fort', ['Magnet'] = 'MagnetHIT', ['Pusher'] = 'PusherHit',
+    ['Anchor'] = 'hitAnchor', ['Space'] = 'HtSpace', ['Boomerang'] = 'BoomerangH',
+    ['Speedrun'] = 'Speedrunhit', ['Mail'] = 'MailHit', ['Golden'] = 'GoldenHit',
+    ['MR'] = 'MisterHit', ['Reaper'] = 'ReaperHit', ['Replica'] = 'ReplicaHit',
+    ['Defense'] = 'DefenseHit', ['Killstreak'] = 'KSHit', ['Reverse'] = 'ReverseHit',
+    ['Shukuchi'] = 'ShukuchiHit', ['Duelist'] = 'DuelistHit', ['woah'] = 'woahHit',
+    ['Ice'] = 'IceHit', ['Adios'] = 'hitAdios', ['Blocked'] = 'BlockedHit',
+    ['Engineer'] = 'engiehit', ['Rocky'] = 'RockyHit', ['Conveyor'] = 'ConvHit',
+    ['STOP'] = 'STOP', ['Phantom'] = 'PhantomHit', ['Wormhole'] = 'WormHit',
+    ['Acrobat'] = 'AcHit', ['Plague'] = 'PlagueHit', ['[REDACTED]'] = 'ReHit',
+    ['bus'] = 'hitbus', ['Phase'] = 'PhaseH', ['Warp'] = 'WarpHt',
+    ['Bomb'] = 'BombHit', ['Bubble'] = 'BubbleHit', ['Jet'] = 'JetHit',
+    ['Shard'] = 'ShardHIT', ['potato'] = 'potatohit', ['CULT'] = 'CULTHit',
+    ['bob'] = 'bobhit', ['Buddies'] = 'buddiesHIT', ['Spy'] = 'SpyHit',
+    ['Detonator'] = 'DetonatorHit', ['Rage'] = 'GRRRR', ['Trap'] = 'traphi',
+    ['Orbit'] = 'Orbihit', ['Hybrid'] = 'HybridCLAP', ['Slapple'] = 'SlappleHit',
+    ['Disarm'] = 'DisarmH', ['Dominance'] = 'DominanceHit', ['Link'] = 'LinkHit',
+    ['Rojo'] = 'RojoHit', ['rob'] = 'robhit', ['Rhythm'] = 'rhythmhit',
+    ['Nightmare'] = 'nightmarehit', ['Hitman'] = 'HitmanHit', ['Thor'] = 'ThorHit',
+    ['Retro'] = 'RetroHit', ['Cloud'] = 'CloudHit', ['Null'] = 'NullHit',
+    ['spin'] = 'spinhit', ['Pylon'] = 'PylonHit', ['Leafblower'] = 'LeafblowerHit',
+    ['Poltergeist'] = 'UTGHit', ['Clock'] = 'UTGHit', ['Untitled Tag Glove'] = 'UTGHit',
+    ['Kinetic'] = 'HtStun', ['Recall'] = 'HtStun', ['Balloony'] = 'HtStun',
+    ['Sparky'] = 'HtStun', ['Boogie'] = 'HtStun', ['Coil'] = 'HtStun',
+    ['Diamond'] = 'DiamondHit', ['Megarock'] = 'DiamondHit', ['Moon'] = 'CelestialHit',
+    ['Jupiter'] = 'CelestialHit', ['Mitten'] = 'MittenHit', ['Hallow Jack'] = 'HallowHIT',
+    ['OVERKILL'] = 'Overkillhit', ['The Flex'] = 'FlexHit', ['Custom'] = 'CustomHit',
+    ["God's Hand"] = 'Godshand', ['Error'] = 'Errorhit'
+}
+
+-- Части тела
+local BODY_PARTS = {
+    "Head", "UpperTorso", "LowerTorso", "LeftUpperArm", "LeftLowerArm", "LeftHand",
+    "RightUpperArm", "RightLowerArm", "RightHand", "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+    "RightUpperLeg", "RightLowerLeg", "RightFoot", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg"
+}
+
+-- Платформа
+local PLATFORM_POS = Vector3.new(-103, 3000000, 144.5)
+local PLATFORM_SIZE = Vector3.new(10000, 10, 10000)
+
+-- ================= GUI =================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AutoBountyReset"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = guiParent
+
+local Frame = Instance.new("Frame", ScreenGui)
+Frame.Size = UDim2.new(0, 260, 0, 230)  -- увеличил высоту для новой кнопки
+Frame.Position = UDim2.new(0.5, -130, 0.5, -115)
+Frame.BackgroundColor3 = Color3.fromRGB(36, 36, 37)
+Frame.Active = true
+Frame.Draggable = true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 8)
+Instance.new("UIStroke", Frame).Color = Color3.fromRGB(60, 60, 60)
+
+local Title = Instance.new("TextLabel", Frame)
+Title.Size = UDim2.new(1, -30, 0, 30); Title.Position = UDim2.new(0, 25, 0, 0)
+Title.BackgroundTransparency = 1; Title.Text = "Auto Bounty Reset"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255); Title.Font = Enum.Font.GothamBold; Title.TextSize = 16
+Title.TextXAlignment = Enum.TextXAlignment.Left
+
+local Close = Instance.new("TextButton", Frame)
+Close.Size = UDim2.new(0, 25, 0, 25); Close.Position = UDim2.new(1, -30, 0, 2)
+Close.BackgroundColor3 = Color3.fromRGB(60, 60, 60); Close.Text = "X"
+Close.TextColor3 = Color3.fromRGB(255, 255, 255); Close.Font = Enum.Font.GothamBold; Close.TextSize = 14
+
+-- Поле ввода ника жертвы
+local VictimBox = Instance.new("TextBox", Frame)
+VictimBox.Position = UDim2.new(0.5, -100, 0, 40); VictimBox.Size = UDim2.new(0, 200, 0, 30)
+VictimBox.PlaceholderText = "Victim's name"; VictimBox.Text = ""
+VictimBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50); VictimBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+VictimBox.Font = Enum.Font.Gotham; VictimBox.TextSize = 14
+
+-- Настройка хитов
+local HitsRow = Instance.new("Frame", Frame)
+HitsRow.Size = UDim2.new(0.9, 0, 0, 30); HitsRow.Position = UDim2.new(0.05, 0, 0, 75)
+HitsRow.BackgroundTransparency = 1
+local HitsInput = Instance.new("TextBox", HitsRow)
+HitsInput.Size = UDim2.new(0.65, 0, 1, 0); HitsInput.Position = UDim2.new(0, 0, 0, 0)
+HitsInput.BackgroundTransparency = 1; HitsInput.Text = "200"; HitsInput.PlaceholderText = "Hits/cycle"
+HitsInput.TextColor3 = Color3.fromRGB(255, 255, 255); HitsInput.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+HitsInput.Font = Enum.Font.Gotham; HitsInput.TextSize = 12; HitsInput.TextXAlignment = Enum.TextXAlignment.Left
+
+local SetHitsBtn = Instance.new("TextButton", HitsRow)
+SetHitsBtn.Size = UDim2.new(0.3, 0, 0.7, 0); SetHitsBtn.Position = UDim2.new(0.68, 0, 0.15, 0)
+SetHitsBtn.BackgroundColor3 = Color3.fromRGB(200, 140, 0); SetHitsBtn.BackgroundTransparency = 0.3
+SetHitsBtn.Text = "SET"; SetHitsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SetHitsBtn.Font = Enum.Font.GothamBold; SetHitsBtn.TextSize = 11
+Instance.new("UICorner", SetHitsBtn).CornerRadius = UDim.new(0, 6)
+
+-- Кнопки Start/Stop
+local StartBtn = Instance.new("TextButton", Frame)
+StartBtn.Position = UDim2.new(0.5, -100, 0, 110); StartBtn.Size = UDim2.new(0, 90, 0, 30)
+StartBtn.Text = "Start"; StartBtn.BackgroundColor3 = Color3.fromRGB(40, 120, 40)
+StartBtn.TextColor3 = Color3.fromRGB(255, 255, 255); StartBtn.Font = Enum.Font.GothamBold; StartBtn.TextSize = 14
+
+local StopBtn = Instance.new("TextButton", Frame)
+StopBtn.Position = UDim2.new(0.5, 10, 0, 110); StopBtn.Size = UDim2.new(0, 90, 0, 30)
+StopBtn.Text = "Stop"; StopBtn.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+StopBtn.TextColor3 = Color3.fromRGB(255, 255, 255); StopBtn.Font = Enum.Font.GothamBold; StopBtn.TextSize = 14
+
+-- НОВАЯ КНОПКА: Создание платформы и телепорт
+local PlatformBtn = Instance.new("TextButton", Frame)
+PlatformBtn.Position = UDim2.new(0.5, -100, 0, 145); PlatformBtn.Size = UDim2.new(0, 200, 0, 30)
+PlatformBtn.Text = "Create Sky Platform & TP"
+PlatformBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 180)
+PlatformBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+PlatformBtn.Font = Enum.Font.GothamBold
+PlatformBtn.TextSize = 12
+
+local Status = Instance.new("TextLabel", Frame)
+Status.Position = UDim2.new(0.5, -100, 0, 185); Status.Size = UDim2.new(0, 200, 0, 30)
+Status.BackgroundTransparency = 1; Status.TextColor3 = Color3.fromRGB(200, 200, 200)
+Status.Font = Enum.Font.Gotham; Status.TextSize = 11; Status.Text = "Status: idle"
+
+-- ================= УВЕДОМЛЕНИЯ =================
+local function notify(msg)
+    StarterGui:SetCore("SendNotification", { Title = "AutoBountyReset", Text = msg, Duration = 3 })
+end
+
+-- ================= УТИЛИТЫ =================
+local function killThread(thread)
+    if thread then pcall(task.cancel, thread) end
+    return nil
+end
+
+local function getRemote()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    if not ls then return ReplicatedStorage:FindFirstChild("GeneralHit") end
+    local glove = ls:FindFirstChild("Glove")
+    if not glove then return ReplicatedStorage:FindFirstChild("GeneralHit") end
+    local name = gloveHitsList[glove.Value] or 'GeneralHit'
+    return ReplicatedStorage:FindFirstChild(name) or ReplicatedStorage:FindFirstChild("GeneralHit")
+end
+
+local function getBodyParts(char)
+    if not char then return {} end
+    local parts = {}
+    for _, n in ipairs(BODY_PARTS) do
+        local p = char:FindFirstChild(n)
+        if p then table.insert(parts, p) end
+    end
+    return parts
+end
+
+-- ================= EXTRA GIVER (ТОЛЬКО СЕБЕ) =================
+local isExtraActive = false
+local extraThread = nil
+local customExtraHits = 200
+
+local function doExtraBurst()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local myParts = getBodyParts(char)
+    if #myParts == 0 then return end
+    local remote = getRemote()
+    if not remote then return end
+    for i = 1, customExtraHits do
+        for _, part in ipairs(myParts) do
+            remote:FireServer(part)
+        end
+    end
+end
+
+local function startExtra()
+    if isExtraActive then return end
+    isExtraActive = true
+    extraThread = task.spawn(function()
+        while isExtraActive do
+            doExtraBurst()
+            task.wait(0.6)
+        end
+    end)
+end
+
+local function stopExtra()
+    isExtraActive = false
+    extraThread = killThread(extraThread)
+end
+
+-- ================= ПОЛУЧЕНИЕ БАУНТИ =================
+local function getBounty()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local bb = char:FindFirstChild("bounty_billboard")
+    if not bb then
+        for _, v in ipairs(char:GetDescendants()) do
+            if v.Name == "bounty_billboard" then bb = v; break end
+        end
+    end
+    if bb then
+        local tl = bb:FindFirstChild("TextLabel") or bb:FindFirstChildOfClass("TextLabel")
+        if tl then return tonumber(tl.Text) end
+    end
+    return nil
+end
+
+-- ================= ПОИСК ИГРОКА =================
+local function findPlayer(name)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower():find(name:lower()) or p.DisplayName:lower():find(name:lower()) then return p end
+    end
+    return nil
+end
+
+-- ================= ОСНОВНОЙ ЦИКЛ =================
+local masterRunning = false
+local victim = nil
+local savedPosition = nil
+local cycleInProgress = false
+
+local function mainLoop()
+    while masterRunning do
+        repeat
+            task.wait(0.2)
+            Status.Text = "Bounty: " .. (getBounty() or "?") .. " | Waiting for 1000"
+        until not masterRunning or (not cycleInProgress and getBounty() and getBounty() >= 1000)
+        if not masterRunning then break end
+
+        cycleInProgress = true
+        Status.Text = "Bounty: 1000 | Stopping Giver..."
+        stopExtra()
+        task.wait(0.5)
+
+        local char = LocalPlayer.Character
+        local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+        if not myRoot then
+            Status.Text = "Error: no character root"
+            startExtra()
+            task.wait(1)
+            cycleInProgress = false
+            continue
+        end
+        savedPosition = myRoot.CFrame
+
+        if not victim or not victim.Character or not victim.Character:FindFirstChild("HumanoidRootPart") then
+            Status.Text = "Error: victim not available"
+            startExtra()
+            task.wait(2)
+            cycleInProgress = false
+            continue
+        end
+        local tChar = victim.Character
+        local tRoot = tChar:FindFirstChild("HumanoidRootPart")
+        local tInArena = tChar:FindFirstChild("isInArena")
+        local iInArena = char:FindFirstChild("isInArena")
+        if not (tRoot and tInArena and tInArena.Value and iInArena and iInArena.Value) then
+            Status.Text = "Error: victim or you not in arena"
+            startExtra()
+            task.wait(2)
+            cycleInProgress = false
+            continue
+        end
+
+        local tpTarget = tRoot.CFrame * CFrame.new(0, 0, -5)
+        pcall(function() char:SetPrimaryPartCFrame(tpTarget) end)
+        if (myRoot.CFrame.Position - tpTarget.Position).Magnitude > 10 then
+            myRoot.CFrame = tpTarget
+        end
+        Status.Text = "Bounty: 1000 | Teleported to " .. victim.Name
+        task.wait(0.3)
+
+        local ragdolled = char:FindFirstChild("Ragdolled")
+        local resetEvent = LocalPlayer:FindFirstChild("Reset")
+        if not ragdolled or not resetEvent then
+            Status.Text = "Error: no Ragdoll/Reset"
+            startExtra()
+            task.wait(1)
+            cycleInProgress = false
+            continue
+        end
+        while not ragdolled.Value do
+            task.wait(0.1)
+            if not masterRunning then break end
+        end
+        if not masterRunning then break end
+
+        resetEvent:FireServer()
+        Status.Text = "Bounty: 1000 | Reset..."
+        task.wait(0.5)
+
+        repeat task.wait(0.2) until not masterRunning or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+        if not masterRunning then break end
+        task.wait(5)
+
+        local portal = Workspace:FindFirstChild("Lobby") and Workspace.Lobby:FindFirstChild("Teleport1")
+        if not portal or not portal:IsA("BasePart") then
+            Status.Text = "Error: portal not found"
+            startExtra()
+            task.wait(1)
+            cycleInProgress = false
+            continue
+        end
+
+        local enteredArena = false
+        for attempt = 1, 5 do
+            if not masterRunning then break end
+            local curChar = LocalPlayer.Character
+            local curRoot = curChar and curChar:FindFirstChild("HumanoidRootPart")
+            if not curRoot then
+                Status.Text = "Lost character, waiting..."
+                repeat task.wait(0.2) until not masterRunning or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+                if not masterRunning then break end
+                task.wait(2)
+                continue
+            end
+            curRoot.CFrame = portal.CFrame
+            Status.Text = "Entering portal (attempt " .. attempt .. ")"
+            task.wait(0.8)
+            for i = 1, 10 do
+                task.wait(0.3)
+                if not masterRunning then break end
+                local checkChar = LocalPlayer.Character
+                if not checkChar then break end
+                local isInArena = checkChar:FindFirstChild("isInArena")
+                if isInArena and isInArena.Value then enteredArena = true; break end
+            end
+            if enteredArena then break end
+        end
+        if not masterRunning then break end
+        if not enteredArena then
+            Status.Text = "Error: failed to enter arena"
+            startExtra()
+            task.wait(1)
+            cycleInProgress = false
+            continue
+        end
+
+        -- Возврат на позицию (с повторами)
+        if savedPosition then
+            local finalChar = LocalPlayer.Character
+            local finalRoot = finalChar and finalChar:FindFirstChild("HumanoidRootPart")
+            if finalRoot then
+                for attempt = 1, 10 do
+                    finalRoot.CFrame = savedPosition
+                    task.wait(0.05)
+                    local dist = (finalRoot.Position - savedPosition.Position).Magnitude
+                    if dist < 5 then break end
+                    pcall(function() finalChar:SetPrimaryPartCFrame(savedPosition) end)
+                    task.wait(0.05)
+                end
+                Status.Text = "Bounty: 1000 | Returned to position"
+                task.wait(1)
+            end
+        end
+
+        local dropWait = 0
+        repeat
+            task.wait(0.3)
+            dropWait = dropWait + 0.3
+            local b = getBounty()
+            Status.Text = "Bounty: " .. (b or "?") .. " | Waiting for drop (timeout in " .. math.floor(10 - dropWait) .. "s)"
+        until not masterRunning or (getBounty() and getBounty() < 1000) or dropWait >= 10
+
+        Status.Text = "Restarting Giver..."
+        startExtra()
+        task.wait(2)
+
+        savedPosition = nil
+        cycleInProgress = false
+    end
+end
+
+-- ================= КНОПКИ =================
+StartBtn.MouseButton1Click:Connect(function()
+    local name = VictimBox.Text
+    if name == "" then notify("Enter victim's name!"); return end
+    local p = findPlayer(name)
+    if not p then notify("Victim not found!"); return end
+    victim = p
+    masterRunning = true
+    cycleInProgress = false
+    Status.Text = "Starting..."
+    startExtra()
+    task.spawn(mainLoop)
+end)
+
+StopBtn.MouseButton1Click:Connect(function()
+    masterRunning = false
+    stopExtra()
+    cycleInProgress = false
+    Status.Text = "Stopped"
+end)
+
+Close.MouseButton1Click:Connect(function()
+    masterRunning = false
+    stopExtra()
+    ScreenGui:Destroy()
+    getgenv().AutoBountyReset_Loaded = nil
+end)
+
+SetHitsBtn.MouseButton1Click:Connect(function()
+    local val = tonumber(HitsInput.Text)
+    if val and val > 0 then
+        customExtraHits = math.floor(val)
+        SetHitsBtn.Text = "SET (" .. customExtraHits .. ")"
+    end
+end)
+
+-- НОВАЯ КНОПКА ПЛАТФОРМЫ
+PlatformBtn.MouseButton1Click:Connect(function()
+    local existing = Workspace:FindFirstChild("TeleportPlatform")
+    if existing then existing:Destroy() end
+    local p = Instance.new("Part")
+    p.Name = "TeleportPlatform"; p.Size = PLATFORM_SIZE; p.Position = PLATFORM_POS
+    p.Anchored = true; p.CanCollide = true; p.Color = Color3.fromRGB(120, 160, 255)
+    p.Material = Enum.Material.Plastic; p.Transparency = 0; p.Parent = Workspace
+    task.wait(0.03)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.CFrame = CFrame.new(PLATFORM_POS + Vector3.new(0, PLATFORM_SIZE.Y/2 + 5, 0))
+        Status.Text = "Teleported to platform"
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if masterRunning then
+        if isExtraActive then
+            stopExtra()
+            task.wait(1)
+            startExtra()
+        end
+    end
+end)
