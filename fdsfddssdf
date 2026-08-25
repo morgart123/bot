@@ -1,0 +1,778 @@
+-- SB ENGINEER HORIZONTAL OWNERSHIP PROBE V1
+-- Один собственный Sentry, движение на 12 studs и автоматический возврат.
+
+local MOVE_DISTANCE = 12
+local MOVE_TIMEOUT = 3
+local HOLD_TIME = 7.5
+local RETURN_TIMEOUT = 4
+local MAX_SENTRY_DISTANCE = 35
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+
+local oldGui = PlayerGui:FindFirstChild(
+    "SBEngineerHorizontalProbe"
+)
+
+if oldGui then
+    oldGui:Destroy()
+end
+
+local report = {}
+local running = false
+local stopRequested = false
+local activeVelocityRecords = nil
+
+local function textOf(...)
+    local packed = table.pack(...)
+
+    for i = 1, packed.n do
+        packed[i] = tostring(packed[i])
+    end
+
+    return table.concat(packed, " ")
+end
+
+local function log(...)
+    local line = textOf(...)
+    table.insert(report, line)
+    print(line)
+end
+
+local clipboardFunction
+
+pcall(function()
+    if type(setclipboard) == "function" then
+        clipboardFunction = setclipboard
+    elseif type(toclipboard) == "function" then
+        clipboardFunction = toclipboard
+    end
+end)
+
+local function copyReport()
+    local output = table.concat(report, "\n")
+
+    if clipboardFunction then
+        return pcall(clipboardFunction, output)
+    end
+
+    print(output)
+    return false
+end
+
+local networkOwnerFunction
+
+pcall(function()
+    if type(isnetworkowner) == "function" then
+        networkOwnerFunction = isnetworkowner
+    end
+end)
+
+local function isNetworkOwner(part)
+    if not networkOwnerFunction then
+        return nil
+    end
+
+    local success, result = pcall(
+        networkOwnerFunction,
+        part
+    )
+
+    if success then
+        return result == true
+    end
+
+    return false
+end
+
+local function pathOf(instance)
+    local success, result = pcall(function()
+        return instance:GetFullName()
+    end)
+
+    return success and result or tostring(instance)
+end
+
+local function getOwnerId(instance)
+    local current = instance
+
+    while current do
+        local ownerId = current:GetAttribute("OwnerId")
+
+        if ownerId ~= nil then
+            return tonumber(ownerId)
+        end
+
+        if current == workspace then
+            break
+        end
+
+        current = current.Parent
+    end
+
+    return nil
+end
+
+local function getSentryRoot(sentry)
+    if sentry:IsA("BasePart")
+        and sentry.Name == "TurretStandBase" then
+        return sentry
+    end
+
+    local namedRoot = sentry:FindFirstChild(
+        "TurretStandBase",
+        true
+    )
+
+    if namedRoot and namedRoot:IsA("BasePart") then
+        return namedRoot
+    end
+
+    if sentry:IsA("Model") then
+        return sentry.PrimaryPart
+            or sentry:FindFirstChildWhichIsA(
+                "BasePart",
+                true
+            )
+    end
+
+    return nil
+end
+
+local function findNearestOwnedSentry()
+    local character = LP.Character
+    local characterRoot = character
+        and character:FindFirstChild("HumanoidRootPart")
+
+    if not characterRoot then
+        return nil, nil, nil
+    end
+
+    local bestSentry
+    local bestRoot
+    local bestDistance = math.huge
+
+    for _, sentry in ipairs(
+        CollectionService:GetTagged("Sentry")
+    ) do
+        if sentry
+            and sentry.Parent
+            and getOwnerId(sentry) == LP.UserId then
+
+            local root = getSentryRoot(sentry)
+
+            if root and root.Parent and not root.Anchored then
+                local distance =
+                    (root.Position - characterRoot.Position).Magnitude
+
+                if distance < bestDistance then
+                    bestSentry = sentry
+                    bestRoot = root
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return bestSentry, bestRoot, bestDistance
+end
+
+local function saveAndNeutralizeBodyVelocities(sentry)
+    local records = {}
+
+    for _, descendant in ipairs(sentry:GetDescendants()) do
+        if descendant:IsA("BodyVelocity") then
+            local record = {
+                instance = descendant,
+                MaxForce = descendant.MaxForce,
+                Velocity = descendant.Velocity,
+                P = descendant.P
+            }
+
+            table.insert(records, record)
+
+            pcall(function()
+                descendant.MaxForce = Vector3.zero
+                descendant.Velocity = Vector3.zero
+                descendant.P = 0
+            end)
+        end
+    end
+
+    return records
+end
+
+local function restoreBodyVelocities(records)
+    if not records then
+        return
+    end
+
+    for _, record in ipairs(records) do
+        local bodyVelocity = record.instance
+
+        if bodyVelocity and bodyVelocity.Parent then
+            pcall(function()
+                bodyVelocity.MaxForce = record.MaxForce
+                bodyVelocity.Velocity = record.Velocity
+                bodyVelocity.P = record.P
+            end)
+        end
+    end
+end
+
+-- GUI
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "SBEngineerHorizontalProbe"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(370, 220)
+frame.Position = UDim2.new(0.5, -185, 0.5, -110)
+frame.BackgroundColor3 = Color3.fromRGB(22, 25, 31)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -20, 0, 34)
+title.Position = UDim2.fromOffset(10, 5)
+title.BackgroundTransparency = 1
+title.Text = "ENGINEER X/Z OWNERSHIP PROBE"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -24, 0, 102)
+status.Position = UDim2.fromOffset(12, 40)
+status.BackgroundColor3 = Color3.fromRGB(32, 36, 44)
+status.TextColor3 = Color3.fromRGB(225, 230, 240)
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Font = Enum.Font.Code
+status.TextSize = 13
+status.Text =
+    "Place one turret on open grass.\n"
+    .. "Keep the right side clear.\n"
+    .. "Then press MOVE X/Z."
+status.Parent = frame
+
+local statusCorner = Instance.new("UICorner")
+statusCorner.CornerRadius = UDim.new(0, 7)
+statusCorner.Parent = status
+
+local function makeButton(text, x, width, color)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.fromOffset(width, 50)
+    button.Position = UDim2.fromOffset(x, 156)
+    button.BackgroundColor3 = color
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.Text = text
+    button.Parent = frame
+
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(0, 7)
+    buttonCorner.Parent = button
+
+    return button
+end
+
+local moveButton = makeButton(
+    "MOVE X/Z",
+    12,
+    148,
+    Color3.fromRGB(48, 142, 94)
+)
+
+local stopButton = makeButton(
+    "STOP",
+    167,
+    84,
+    Color3.fromRGB(174, 63, 63)
+)
+
+local copyButton = makeButton(
+    "COPY",
+    258,
+    100,
+    Color3.fromRGB(68, 95, 166)
+)
+
+local function horizontalVector(vector)
+    return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function driveToPosition(
+    assemblyRoot,
+    targetPosition,
+    timeout,
+    phaseName
+)
+    local started = os.clock()
+    local bestDistance = math.huge
+    local maximumTravel = 0
+    local origin = assemblyRoot.Position
+    local lastUiUpdate = 0
+
+    while os.clock() - started < timeout do
+        if stopRequested or not assemblyRoot.Parent then
+            break
+        end
+
+        local currentPosition = assemblyRoot.Position
+        local errorVector = horizontalVector(
+            targetPosition - currentPosition
+        )
+
+        local remaining = errorVector.Magnitude
+        bestDistance = math.min(bestDistance, remaining)
+
+        maximumTravel = math.max(
+            maximumTravel,
+            horizontalVector(
+                currentPosition - origin
+            ).Magnitude
+        )
+
+        local desiredHorizontalVelocity = Vector3.zero
+
+        if remaining > 0.08 then
+            local speed = math.min(
+                38,
+                math.max(2, remaining * 7)
+            )
+
+            desiredHorizontalVelocity =
+                errorVector.Unit * speed
+        end
+
+        local currentVelocity =
+            assemblyRoot.AssemblyLinearVelocity
+
+        assemblyRoot.AssemblyLinearVelocity =
+            Vector3.new(
+                desiredHorizontalVelocity.X,
+                currentVelocity.Y,
+                desiredHorizontalVelocity.Z
+            )
+
+        assemblyRoot.AssemblyAngularVelocity =
+            Vector3.zero
+
+        if os.clock() - lastUiUpdate >= 0.15 then
+            lastUiUpdate = os.clock()
+
+            status.Text = string.format(
+                "%s\n"
+                .. "Remaining: %.2f studs\n"
+                .. "Elapsed: %.1f / %.1f s",
+                phaseName,
+                remaining,
+                os.clock() - started,
+                timeout
+            )
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local finalRemaining = assemblyRoot.Parent
+        and horizontalVector(
+            targetPosition - assemblyRoot.Position
+        ).Magnitude
+        or math.huge
+
+    return finalRemaining, bestDistance, maximumTravel
+end
+
+local function runProbe()
+    table.clear(report)
+    stopRequested = false
+
+    log("=== ENGINEER HORIZONTAL OWNERSHIP PROBE V1 ===")
+    log("Player:", LP.Name)
+    log("UserId:", LP.UserId)
+    log("JobId:", game.JobId)
+    log(
+        "Private marker:",
+        game.PrivateServerId ~= "" and "TRUE" or "UNKNOWN"
+    )
+
+    local character = LP.Character
+    local characterRoot = character
+        and character:FindFirstChild("HumanoidRootPart")
+
+    if not characterRoot then
+        log("RESULT: CHARACTER ROOT NOT FOUND")
+        status.Text = "CHARACTER ROOT NOT FOUND"
+        copyReport()
+        return
+    end
+
+    local sentry, root, distance =
+        findNearestOwnedSentry()
+
+    if not sentry or not root then
+        log("RESULT: OWNED SENTRY NOT FOUND")
+        status.Text =
+            "OWNED SENTRY NOT FOUND\n"
+            .. "Place a normal turret and retry."
+        copyReport()
+        return
+    end
+
+    if distance > MAX_SENTRY_DISTANCE then
+        log("RESULT: SENTRY TOO FAR:", distance)
+        status.Text = string.format(
+            "SENTRY TOO FAR\nDistance: %.2f",
+            distance
+        )
+        copyReport()
+        return
+    end
+
+    local assemblyRoot = root.AssemblyRootPart or root
+    local ownerBefore = isNetworkOwner(assemblyRoot)
+
+    log("Sentry:", pathOf(sentry))
+    log("Root:", pathOf(root))
+    log("Assembly root:", pathOf(assemblyRoot))
+    log("OwnerId:", getOwnerId(sentry))
+    log("Distance:", string.format("%.3f", distance))
+    log("Anchored:", assemblyRoot.Anchored)
+    log("Network owner before:", ownerBefore)
+
+    if ownerBefore == false then
+        log("RESULT: CLIENT IS NOT NETWORK OWNER")
+        status.Text =
+            "NETWORK OWNER: FALSE\n"
+            .. "Stand closer and retry."
+        copyReport()
+        return
+    end
+
+    local startPosition = assemblyRoot.Position
+
+    local direction = horizontalVector(
+        characterRoot.CFrame.RightVector
+    )
+
+    if direction.Magnitude < 0.1 then
+        direction = Vector3.new(1, 0, 0)
+    else
+        direction = direction.Unit
+    end
+
+    local targetPosition =
+        startPosition + direction * MOVE_DISTANCE
+
+    log("Start position:", startPosition)
+    log("Move direction:", direction)
+    log("Target position:", targetPosition)
+    log("Requested horizontal distance:", MOVE_DISTANCE)
+
+    local records =
+        saveAndNeutralizeBodyVelocities(sentry)
+
+    activeVelocityRecords = records
+
+    log("BodyVelocity objects found:", #records)
+
+    for index, record in ipairs(records) do
+        log(
+            "BV[" .. index .. "]:",
+            pathOf(record.instance),
+            "old MaxForce=" .. tostring(record.MaxForce),
+            "new MaxForce=" .. tostring(
+                record.instance.MaxForce
+            )
+        )
+    end
+
+    if #records == 0 then
+        log("RESULT: NO BODYVELOCITY FOUND")
+        status.Text = "NO BODYVELOCITY FOUND"
+        activeVelocityRecords = nil
+        copyReport()
+        return
+    end
+
+    local moveRemaining =
+        driveToPosition(
+            assemblyRoot,
+            targetPosition,
+            MOVE_TIMEOUT,
+            "MOVING HORIZONTALLY"
+        )
+
+    local reachedPosition = assemblyRoot.Position
+    local reachedDistance = horizontalVector(
+        reachedPosition - startPosition
+    ).Magnitude
+
+    log(
+        "Horizontal distance after move:",
+        string.format("%.3f", reachedDistance)
+    )
+    log(
+        "Distance from target after move:",
+        string.format("%.3f", moveRemaining)
+    )
+
+    local maximumDistance = reachedDistance
+    local activationSeen = false
+    local ownerLost = false
+    local holdStarted = os.clock()
+
+    while os.clock() - holdStarted < HOLD_TIME do
+        if stopRequested or not assemblyRoot.Parent then
+            break
+        end
+
+        local currentPosition = assemblyRoot.Position
+        local errorVector = horizontalVector(
+            targetPosition - currentPosition
+        )
+
+        local desiredVelocity = Vector3.zero
+
+        if errorVector.Magnitude > 0.05 then
+            local speed = math.min(
+                25,
+                math.max(1, errorVector.Magnitude * 8)
+            )
+
+            desiredVelocity = errorVector.Unit * speed
+        end
+
+        local currentVelocity =
+            assemblyRoot.AssemblyLinearVelocity
+
+        assemblyRoot.AssemblyLinearVelocity =
+            Vector3.new(
+                desiredVelocity.X,
+                currentVelocity.Y,
+                desiredVelocity.Z
+            )
+
+        assemblyRoot.AssemblyAngularVelocity =
+            Vector3.zero
+
+        local horizontalTravel = horizontalVector(
+            currentPosition - startPosition
+        ).Magnitude
+
+        maximumDistance = math.max(
+            maximumDistance,
+            horizontalTravel
+        )
+
+        if networkOwnerFunction
+            and isNetworkOwner(assemblyRoot) == false then
+            ownerLost = true
+        end
+
+        local hitbox =
+            sentry:FindFirstChild("Hitbox", true)
+
+        if hitbox
+            and hitbox:FindFirstChildWhichIsA(
+                "TouchTransmitter"
+            ) then
+            activationSeen = true
+        end
+
+        status.Text = string.format(
+            "HOLDING AT X/Z TARGET\n"
+            .. "Time: %.1f / %.1f s\n"
+            .. "Moved: %.2f studs\n"
+            .. "Target error: %.2f",
+            os.clock() - holdStarted,
+            HOLD_TIME,
+            horizontalTravel,
+            errorVector.Magnitude
+        )
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local heldPosition = assemblyRoot.Parent
+        and assemblyRoot.Position
+        or startPosition
+
+    local heldDistance = horizontalVector(
+        heldPosition - startPosition
+    ).Magnitude
+
+    local targetError = horizontalVector(
+        targetPosition - heldPosition
+    ).Magnitude
+
+    local tagSurvived =
+        sentry.Parent ~= nil
+        and CollectionService:HasTag(sentry, "Sentry")
+
+    log(
+        "Maximum horizontal distance:",
+        string.format("%.3f", maximumDistance)
+    )
+    log(
+        "Held horizontal distance:",
+        string.format("%.3f", heldDistance)
+    )
+    log(
+        "Held target error:",
+        string.format("%.3f", targetError)
+    )
+    log("Network ownership lost:", ownerLost)
+    log("Sentry tag survived:", tagSurvived)
+    log("Touch activation observed:", activationSeen)
+    log("Stopped manually:", stopRequested)
+
+    local movementPassed =
+        not stopRequested
+        and maximumDistance >= MOVE_DISTANCE * 0.7
+        and heldDistance >= MOVE_DISTANCE * 0.6
+        and tagSurvived
+
+    if not stopRequested and assemblyRoot.Parent then
+        log("Returning turret to original position...")
+
+        driveToPosition(
+            assemblyRoot,
+            startPosition,
+            RETURN_TIMEOUT,
+            "RETURNING TO START"
+        )
+    end
+
+    restoreBodyVelocities(records)
+    activeVelocityRecords = nil
+
+    local returnError = assemblyRoot.Parent
+        and horizontalVector(
+            assemblyRoot.Position - startPosition
+        ).Magnitude
+        or math.huge
+
+    log(
+        "Return position error:",
+        string.format("%.3f", returnError)
+    )
+    log("BodyVelocity properties restored:", true)
+
+    if movementPassed then
+        log(
+            "RESULT: LOCAL X/Z PHYSICS PASS —",
+            "BODYVELOCITY WAS BYPASSED"
+        )
+
+        if activationSeen then
+            log(
+                "STRONG: SENTRY REMAINED ACTIVE",
+                "AT RELOCATED X/Z POSITION"
+            )
+        end
+
+        log(
+            "FINAL PROOF REQUIRED:",
+            "DID THE ORDINARY ALT SEE THE X/Z MOVE?"
+        )
+
+        status.Text =
+            "X/Z CANDIDATE PASS\n"
+            .. string.format(
+                "Held distance: %.2f studs\n",
+                heldDistance
+            )
+            .. "Did the ordinary alt see it?"
+
+        status.TextColor3 =
+            Color3.fromRGB(103, 255, 151)
+    else
+        log(
+            "RESULT: REJECTED —",
+            "HORIZONTAL RELOCATION DID NOT HOLD"
+        )
+
+        status.Text =
+            "X/Z REJECTED\n"
+            .. string.format(
+                "Maximum: %.2f | Held: %.2f",
+                maximumDistance,
+                heldDistance
+            )
+
+        status.TextColor3 =
+            Color3.fromRGB(255, 120, 120)
+    end
+
+    local copied = copyReport()
+    log("Clipboard copied:", copied)
+end
+
+moveButton.MouseButton1Click:Connect(function()
+    if running then
+        return
+    end
+
+    running = true
+
+    task.spawn(function()
+        local success, runtimeError = xpcall(
+            runProbe,
+            function(value)
+                return tostring(value)
+            end
+        )
+
+        if activeVelocityRecords then
+            restoreBodyVelocities(activeVelocityRecords)
+            activeVelocityRecords = nil
+        end
+
+        if not success then
+            log("RUNTIME ERROR:", runtimeError)
+            status.Text =
+                "RUNTIME ERROR\n" .. runtimeError
+            status.TextColor3 =
+                Color3.fromRGB(255, 120, 120)
+            copyReport()
+        end
+
+        running = false
+    end)
+end)
+
+stopButton.MouseButton1Click:Connect(function()
+    stopRequested = true
+    status.Text = "STOP REQUESTED — RESTORING"
+
+    if activeVelocityRecords then
+        restoreBodyVelocities(activeVelocityRecords)
+    end
+end)
+
+copyButton.MouseButton1Click:Connect(function()
+    local copied = copyReport()
+
+    status.Text = copied
+        and "REPORT COPIED"
+        or "CLIPBOARD UNAVAILABLE — SEE CONSOLE"
+end)
