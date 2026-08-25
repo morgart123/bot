@@ -1,0 +1,531 @@
+-- SB ENGINEER VERTICAL OWNERSHIP PROBE V1
+-- Поднимает только одну собственную серверную турель.
+-- Не вызывает remotes и не взаимодействует с игроками.
+
+local HEIGHT = 12
+local HOLD_TIME = 7.5
+local MAX_DISTANCE = 35
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+
+local oldGui = PlayerGui:FindFirstChild("SBEngineerVerticalProbe")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local report = {}
+local running = false
+local stopRequested = false
+
+local function stringify(...)
+    local packed = table.pack(...)
+
+    for i = 1, packed.n do
+        packed[i] = tostring(packed[i])
+    end
+
+    return table.concat(packed, " ")
+end
+
+local function log(...)
+    local line = stringify(...)
+    table.insert(report, line)
+    print(line)
+end
+
+local clipboardFunction
+
+pcall(function()
+    if type(setclipboard) == "function" then
+        clipboardFunction = setclipboard
+    elseif type(toclipboard) == "function" then
+        clipboardFunction = toclipboard
+    end
+end)
+
+local function copyReport()
+    local text = table.concat(report, "\n")
+
+    if clipboardFunction then
+        local success = pcall(clipboardFunction, text)
+        return success
+    end
+
+    print(text)
+    return false
+end
+
+local networkOwnerFunction
+
+pcall(function()
+    if type(isnetworkowner) == "function" then
+        networkOwnerFunction = isnetworkowner
+    end
+end)
+
+local function checkNetworkOwner(part)
+    if type(networkOwnerFunction) ~= "function" then
+        return nil
+    end
+
+    local success, result = pcall(networkOwnerFunction, part)
+
+    if success then
+        return result == true
+    end
+
+    return false
+end
+
+local function getPath(instance)
+    local success, result = pcall(function()
+        return instance:GetFullName()
+    end)
+
+    return success and result or tostring(instance)
+end
+
+local function getOwnerId(instance)
+    local current = instance
+
+    while current do
+        local ownerId = current:GetAttribute("OwnerId")
+
+        if ownerId ~= nil then
+            return tonumber(ownerId)
+        end
+
+        if current == workspace then
+            break
+        end
+
+        current = current.Parent
+    end
+
+    return nil
+end
+
+local function findTurretRoot(instance)
+    if instance:IsA("BasePart")
+        and instance.Name == "TurretStandBase" then
+        return instance
+    end
+
+    local namedRoot = instance:FindFirstChild(
+        "TurretStandBase",
+        true
+    )
+
+    if namedRoot and namedRoot:IsA("BasePart") then
+        return namedRoot
+    end
+
+    if instance:IsA("Model") then
+        return instance.PrimaryPart
+            or instance:FindFirstChildWhichIsA(
+                "BasePart",
+                true
+            )
+    end
+
+    return nil
+end
+
+local function findNearestOwnedSentry()
+    local character = LP.Character
+    local characterRoot = character
+        and character:FindFirstChild("HumanoidRootPart")
+
+    if not characterRoot then
+        return nil, nil, nil
+    end
+
+    local selected
+    local selectedRoot
+    local selectedDistance = math.huge
+
+    for _, sentry in ipairs(
+        CollectionService:GetTagged("Sentry")
+    ) do
+        if sentry
+            and sentry.Parent
+            and getOwnerId(sentry) == LP.UserId then
+
+            local root = findTurretRoot(sentry)
+
+            if root and root.Parent and not root.Anchored then
+                local distance =
+                    (root.Position - characterRoot.Position).Magnitude
+
+                if distance < selectedDistance then
+                    selected = sentry
+                    selectedRoot = root
+                    selectedDistance = distance
+                end
+            end
+        end
+    end
+
+    return selected, selectedRoot, selectedDistance
+end
+
+-- GUI
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "SBEngineerVerticalProbe"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(360, 210)
+frame.Position = UDim2.new(0.5, -180, 0.5, -105)
+frame.BackgroundColor3 = Color3.fromRGB(23, 25, 31)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -20, 0, 34)
+title.Position = UDim2.fromOffset(10, 6)
+title.BackgroundTransparency = 1
+title.Text = "ENGINEER VERTICAL PROBE"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -24, 0, 92)
+status.Position = UDim2.fromOffset(12, 42)
+status.BackgroundColor3 = Color3.fromRGB(33, 36, 44)
+status.TextColor3 = Color3.fromRGB(220, 225, 235)
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Font = Enum.Font.Code
+status.TextSize = 13
+status.Text = "Place one Engineer turret normally.\nStay near it, then press LIFT + HOLD."
+status.Parent = frame
+
+local statusCorner = Instance.new("UICorner")
+statusCorner.CornerRadius = UDim.new(0, 7)
+statusCorner.Parent = status
+
+local function makeButton(text, position, width, color)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.fromOffset(width, 48)
+    button.Position = UDim2.fromOffset(position, 148)
+    button.BackgroundColor3 = color
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.Text = text
+    button.Parent = frame
+
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(0, 7)
+    buttonCorner.Parent = button
+
+    return button
+end
+
+local liftButton = makeButton(
+    "LIFT + HOLD",
+    12,
+    145,
+    Color3.fromRGB(45, 139, 92)
+)
+
+local stopButton = makeButton(
+    "STOP",
+    164,
+    82,
+    Color3.fromRGB(170, 62, 62)
+)
+
+local copyButton = makeButton(
+    "COPY",
+    253,
+    95,
+    Color3.fromRGB(69, 94, 163)
+)
+
+local function runProbe()
+    table.clear(report)
+    stopRequested = false
+
+    log("=== ENGINEER VERTICAL OWNERSHIP PROBE V1 ===")
+    log("Player:", LP.Name)
+    log("UserId:", LP.UserId)
+    log("JobId:", game.JobId)
+    log(
+        "Private marker from client:",
+        game.PrivateServerId ~= "" and "TRUE" or "UNKNOWN"
+    )
+
+    local sentry, root, distance =
+        findNearestOwnedSentry()
+
+    if not sentry or not root then
+        status.Text =
+            "NO OWNED SENTRY FOUND\n"
+            .. "Place a normal turret and try again."
+
+        log("RESULT: NO OWNED SERVER SENTRY FOUND")
+        copyReport()
+        return
+    end
+
+    log("Sentry:", getPath(sentry))
+    log("Root:", getPath(root))
+    log("OwnerId:", getOwnerId(sentry))
+    log("Distance:", string.format("%.3f", distance))
+    log("Anchored:", root.Anchored)
+
+    if distance > MAX_DISTANCE then
+        status.Text =
+            "TOO FAR FROM SENTRY\n"
+            .. string.format("Distance: %.2f studs", distance)
+
+        log("RESULT: TOO FAR FROM SENTRY")
+        copyReport()
+        return
+    end
+
+    local assemblyRoot = root.AssemblyRootPart or root
+
+    log("Assembly root:", getPath(assemblyRoot))
+    log("Assembly mass:", assemblyRoot.AssemblyMass)
+
+    local bodyVelocity =
+        root:FindFirstChildWhichIsA("BodyVelocity")
+
+    if bodyVelocity then
+        log("BodyVelocity:", getPath(bodyVelocity))
+        log("BodyVelocity MaxForce:", bodyVelocity.MaxForce)
+    else
+        log("BodyVelocity on root: NOT FOUND")
+    end
+
+    local networkOwner = checkNetworkOwner(assemblyRoot)
+    log("Network owner initial:", networkOwner)
+
+    if networkOwner == false then
+        status.Text =
+            "NETWORK OWNER: FALSE\n"
+            .. "Stand closer to a fresh turret and retry."
+
+        log("RESULT: NO CLIENT NETWORK OWNERSHIP")
+        copyReport()
+        return
+    end
+
+    if networkOwner == nil then
+        log("Network-owner function unavailable; continuing")
+    end
+
+    local startPosition = assemblyRoot.Position
+    local targetY = startPosition.Y + HEIGHT
+    local maximumY = startPosition.Y
+    local minimumY = startPosition.Y
+    local activationSeen = false
+    local ownerLost = false
+
+    log("Start position:", startPosition)
+    log("Target Y:", targetY)
+    log("Height requested:", HEIGHT)
+    log("Hold seconds:", HOLD_TIME)
+
+    local started = os.clock()
+    local lastDisplay = 0
+
+    while os.clock() - started < HOLD_TIME do
+        if stopRequested or not assemblyRoot.Parent then
+            break
+        end
+
+        local position = assemblyRoot.Position
+        local velocity = assemblyRoot.AssemblyLinearVelocity
+        local yError = targetY - position.Y
+
+        -- Управление только вертикальной скоростью.
+        -- CFrame и PivotTo намеренно не используются.
+        local wantedYVelocity = math.clamp(
+            yError * 8,
+            -25,
+            55
+        )
+
+        assemblyRoot.AssemblyLinearVelocity =
+            Vector3.new(
+                velocity.X,
+                wantedYVelocity,
+                velocity.Z
+            )
+
+        maximumY = math.max(maximumY, position.Y)
+        minimumY = math.min(minimumY, position.Y)
+
+        if networkOwnerFunction
+            and checkNetworkOwner(assemblyRoot) == false then
+            ownerLost = true
+        end
+
+        if os.clock() - started >= 5.4 then
+            local hitbox =
+                sentry:FindFirstChild("Hitbox", true)
+
+            if hitbox
+                and hitbox:FindFirstChildWhichIsA(
+                    "TouchTransmitter"
+                ) then
+                activationSeen = true
+            end
+        end
+
+        if os.clock() - lastDisplay >= 0.15 then
+            lastDisplay = os.clock()
+
+            status.Text = string.format(
+                "HOLDING SERVER SENTRY\n"
+                .. "Time: %.1f / %.1f s\n"
+                .. "Current Y delta: %.2f\n"
+                .. "Max Y delta: %.2f",
+                os.clock() - started,
+                HOLD_TIME,
+                position.Y - startPosition.Y,
+                maximumY - startPosition.Y
+            )
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local heldPosition = assemblyRoot.Parent
+        and assemblyRoot.Position
+        or startPosition
+
+    if assemblyRoot.Parent then
+        local velocity = assemblyRoot.AssemblyLinearVelocity
+
+        assemblyRoot.AssemblyLinearVelocity =
+            Vector3.new(velocity.X, 0, velocity.Z)
+    end
+
+    local maxDelta = maximumY - startPosition.Y
+    local heldDelta = heldPosition.Y - startPosition.Y
+    local tagSurvived =
+        sentry.Parent ~= nil
+        and CollectionService:HasTag(sentry, "Sentry")
+
+    log("Maximum Y delta:", string.format("%.3f", maxDelta))
+    log("Held Y delta:", string.format("%.3f", heldDelta))
+    log("Minimum Y delta:", string.format(
+        "%.3f",
+        minimumY - startPosition.Y
+    ))
+    log("Network ownership lost:", ownerLost)
+    log("Sentry tag survived:", tagSurvived)
+    log("Touch activation observed:", activationSeen)
+    log("Stopped manually:", stopRequested)
+
+    if not stopRequested
+        and maxDelta >= HEIGHT * 0.7
+        and heldDelta >= HEIGHT * 0.5
+        and tagSurvived then
+
+        log(
+            "RESULT: LOCAL PHYSICS PASS —",
+            "SERVER SENTRY WAS HELD ABOVE PLACEMENT"
+        )
+
+        if activationSeen then
+            log(
+                "STRONG: SENTRY ACTIVATED",
+                "WHILE RELOCATED"
+            )
+        end
+
+        log(
+            "FINAL PROOF REQUIRED:",
+            "DID THE ORDINARY ALT SEE IT MOVE?"
+        )
+
+        status.Text =
+            "CANDIDATE PASS\n"
+            .. string.format(
+                "Held %.2f studs above ground\n",
+                heldDelta
+            )
+            .. "Check whether the ordinary alt saw it."
+
+        status.TextColor3 = Color3.fromRGB(104, 255, 151)
+    else
+        log(
+            "RESULT: REJECTED OR INCOMPLETE —",
+            "VERTICAL RELOCATION DID NOT HOLD"
+        )
+
+        status.Text =
+            "REJECTED / INCOMPLETE\n"
+            .. string.format(
+                "Max: %.2f | Held: %.2f",
+                maxDelta,
+                heldDelta
+            )
+
+        status.TextColor3 = Color3.fromRGB(255, 120, 120)
+    end
+
+    local copied = copyReport()
+    log("Clipboard copied:", copied)
+end
+
+liftButton.MouseButton1Click:Connect(function()
+    if running then
+        return
+    end
+
+    running = true
+
+    task.spawn(function()
+        local success, runtimeError = xpcall(
+            runProbe,
+            function(value)
+                return tostring(value)
+            end
+        )
+
+        if not success then
+            log("RUNTIME ERROR:", runtimeError)
+            status.Text = "RUNTIME ERROR\n" .. runtimeError
+            status.TextColor3 = Color3.fromRGB(255, 120, 120)
+            copyReport()
+        end
+
+        running = false
+    end)
+end)
+
+stopButton.MouseButton1Click:Connect(function()
+    stopRequested = true
+    status.Text = "STOP REQUESTED"
+end)
+
+copyButton.MouseButton1Click:Connect(function()
+    local copied = copyReport()
+    status.Text = copied
+        and "REPORT COPIED"
+        or "CLIPBOARD UNAVAILABLE — SEE CONSOLE"
+end)
