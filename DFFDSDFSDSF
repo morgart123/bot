@@ -1,0 +1,1237 @@
+-- SB ENGINEER 3D RELOCATION DEMO GUI V3.1
+-- Bounded proof-of-concept: controls only a Sentry whose OwnerId matches LocalPlayer.UserId.
+
+local DEFAULT_STEP = 10
+local DEFAULT_SIDE_DISTANCE = 15
+local DEFAULT_SPEED = 85
+local POSITION_GAIN = 8
+local TELEPORT_THRESHOLD = 25
+local OWNERSHIP_GRACE_SECONDS = 1.5
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+pcall(function()
+    if type(shared.SBEngineer3DDemoCleanup) == "function" then
+        shared.SBEngineer3DDemoCleanup()
+    end
+end)
+
+local previousGui = PlayerGui:FindFirstChild("SBEngineer3DDemo")
+if previousGui then
+    previousGui:Destroy()
+end
+
+local state = {
+    sentry = nil,
+    root = nil,
+    initialPosition = nil,
+    originalPosition = nil,
+    targetPosition = nil,
+    originalPlayerYOffset = nil,
+    bodyVelocities = nil,
+    controlling = false,
+    returning = false,
+    returnStableSince = nil,
+    ownershipLostAt = nil,
+    pausedForOwnership = false,
+    followTeleport = true,
+    autoCapture = true,
+    movementMode = "SMOOTH",
+    lastCharacterPosition = nil,
+    closed = false,
+}
+
+local report = {}
+local clipboardFunction
+local networkOwnerFunction
+
+pcall(function()
+    if type(setclipboard) == "function" then
+        clipboardFunction = setclipboard
+    elseif type(toclipboard) == "function" then
+        clipboardFunction = toclipboard
+    end
+end)
+
+pcall(function()
+    if type(isnetworkowner) == "function" then
+        networkOwnerFunction = isnetworkowner
+    end
+end)
+
+local function stringify(...)
+    local values = table.pack(...)
+    for index = 1, values.n do
+        values[index] = tostring(values[index])
+    end
+    return table.concat(values, " ")
+end
+
+local function log(...)
+    local line = stringify(...)
+    table.insert(report, line)
+    print(line)
+end
+
+local function copyReport()
+    local output = table.concat(report, "\n")
+    if clipboardFunction then
+        return pcall(clipboardFunction, output)
+    end
+    print(output)
+    return false
+end
+
+local function pathOf(instance)
+    local success, result = pcall(function()
+        return instance:GetFullName()
+    end)
+    return success and result or tostring(instance)
+end
+
+local function getCharacterRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getOwnerId(instance)
+    local current = instance
+    while current do
+        local ownerId = current:GetAttribute("OwnerId")
+        if ownerId ~= nil then
+            return tonumber(ownerId)
+        end
+        if current == workspace then
+            break
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+local function getSentryRoot(sentry)
+    if sentry:IsA("BasePart") and sentry.Name == "TurretStandBase" then
+        return sentry
+    end
+
+    local namedRoot = sentry:FindFirstChild("TurretStandBase", true)
+    if namedRoot and namedRoot:IsA("BasePart") then
+        return namedRoot
+    end
+
+    if sentry:IsA("Model") then
+        return sentry.PrimaryPart
+            or sentry:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    return nil
+end
+
+local function ownsPhysics(part)
+    if not networkOwnerFunction then
+        return nil
+    end
+
+    local success, result = pcall(networkOwnerFunction, part)
+    if success then
+        return result == true
+    end
+    return false
+end
+
+local function hasActiveTouch(sentry)
+    if not sentry or not sentry.Parent then
+        return false
+    end
+
+    local hitbox = sentry:FindFirstChild("Hitbox", true)
+    return hitbox ~= nil
+        and hitbox:FindFirstChildWhichIsA("TouchTransmitter") ~= nil
+end
+
+local function findNearestOwnedSentry()
+    local characterRoot = getCharacterRoot()
+    if not characterRoot then
+        return nil, nil, nil
+    end
+
+    local selectedSentry
+    local selectedRoot
+    local selectedDistance = math.huge
+
+    for _, sentry in ipairs(CollectionService:GetTagged("Sentry")) do
+        if sentry
+            and sentry.Parent
+            and getOwnerId(sentry) == LocalPlayer.UserId then
+
+            local root = getSentryRoot(sentry)
+            if root and root.Parent and not root.Anchored then
+                local assemblyRoot = root.AssemblyRootPart or root
+                local distance = (assemblyRoot.Position - characterRoot.Position).Magnitude
+
+                if distance < selectedDistance then
+                    selectedSentry = sentry
+                    selectedRoot = assemblyRoot
+                    selectedDistance = distance
+                end
+            end
+        end
+    end
+
+    return selectedSentry, selectedRoot, selectedDistance
+end
+
+local function saveAndNeutralizeBodyVelocities()
+    if not state.sentry or not state.sentry.Parent then
+        return false
+    end
+
+    if not state.bodyVelocities then
+        state.bodyVelocities = {}
+
+        for _, descendant in ipairs(state.sentry:GetDescendants()) do
+            if descendant:IsA("BodyVelocity") then
+                table.insert(state.bodyVelocities, {
+                    instance = descendant,
+                    maxForce = descendant.MaxForce,
+                    velocity = descendant.Velocity,
+                    p = descendant.P,
+                })
+            end
+        end
+
+        log("BODYVELOCITIES CAPTURED:", #state.bodyVelocities)
+    end
+
+    for _, record in ipairs(state.bodyVelocities) do
+        local bodyVelocity = record.instance
+        if bodyVelocity and bodyVelocity.Parent then
+            pcall(function()
+                bodyVelocity.MaxForce = Vector3.zero
+                bodyVelocity.Velocity = Vector3.zero
+                bodyVelocity.P = 0
+            end)
+        end
+    end
+
+    return #state.bodyVelocities > 0
+end
+
+local function restoreBodyVelocities()
+    if not state.bodyVelocities then
+        return
+    end
+
+    for _, record in ipairs(state.bodyVelocities) do
+        local bodyVelocity = record.instance
+        if bodyVelocity and bodyVelocity.Parent then
+            pcall(function()
+                bodyVelocity.MaxForce = record.maxForce
+                bodyVelocity.Velocity = record.velocity
+                bodyVelocity.P = record.p
+            end)
+        end
+    end
+
+    log("BODYVELOCITIES RESTORED")
+    state.bodyVelocities = nil
+end
+
+local function stopController(restoreForces)
+    state.controlling = false
+    state.returning = false
+    state.returnStableSince = nil
+    state.ownershipLostAt = nil
+    state.pausedForOwnership = false
+
+    if state.root and state.root.Parent then
+        pcall(function()
+            state.root.AssemblyLinearVelocity = Vector3.zero
+            state.root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    if restoreForces then
+        restoreBodyVelocities()
+    end
+end
+
+local function getWholeSentryContainer()
+    local sentry = state.sentry
+    local root = state.root
+
+    if not sentry or not sentry.Parent or not root or not root.Parent then
+        return nil
+    end
+
+    if sentry:IsA("Model") then
+        return sentry
+    end
+
+    -- The Sentry tag can be placed on a part instead of the outer Turret model.
+    -- Walk upward and keep the highest owned model below Workspace so every
+    -- hinge-connected assembly is moved in the same PivotTo operation.
+    local current = sentry.Parent
+    local selectedModel
+
+    while current and current ~= workspace do
+        if current:IsA("Model")
+            and current:IsAncestorOf(root)
+            and getOwnerId(current) == LocalPlayer.UserId then
+            selectedModel = current
+        end
+        current = current.Parent
+    end
+
+    return selectedModel
+end
+
+local function zeroWholeSentryVelocity()
+    local root = state.root
+    local sentry = state.sentry
+
+    if root and root.Parent then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    if sentry and sentry.Parent then
+        for _, descendant in ipairs(sentry:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                pcall(function()
+                    descendant.AssemblyLinearVelocity = Vector3.zero
+                    descendant.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+    end
+end
+
+local function snapRootTo(targetPosition)
+    local root = state.root
+    if not root or not root.Parent then
+        return false
+    end
+
+    local container = getWholeSentryContainer()
+    local success
+
+    if container then
+        success = pcall(function()
+            local currentPivot = container:GetPivot()
+            local translation = targetPosition - root.Position
+            local targetPivot = CFrame.new(currentPivot.Position + translation)
+                * currentPivot.Rotation
+            container:PivotTo(targetPivot)
+        end)
+    else
+        success = pcall(function()
+            root.CFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
+        end)
+    end
+
+    if success then
+        zeroWholeSentryVelocity()
+    end
+
+    return success
+end
+
+-- GUI
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "SBEngineer3DDemo"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.Parent = PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.fromOffset(420, 575)
+frame.Position = UDim2.new(0.5, -210, 0.5, -287)
+frame.BackgroundColor3 = Color3.fromRGB(21, 24, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 11)
+frameCorner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -55, 0, 38)
+title.Position = UDim2.fromOffset(12, 5)
+title.BackgroundTransparency = 1
+title.Text = "ENGINEER 3D SERVER DEMO V3.1"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.Parent = frame
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.fromOffset(38, 32)
+closeButton.Position = UDim2.new(1, -45, 0, 8)
+closeButton.BackgroundColor3 = Color3.fromRGB(156, 54, 61)
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.new(1, 1, 1)
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 15
+closeButton.Parent = frame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 7)
+closeCorner.Parent = closeButton
+
+local instruction = Instance.new("TextLabel")
+instruction.Size = UDim2.new(1, -24, 0, 48)
+instruction.Position = UDim2.fromOffset(12, 45)
+instruction.BackgroundColor3 = Color3.fromRGB(31, 35, 43)
+instruction.Text = "Place Engineer turret normally. AUTO CAPTURE is ON; CAPTURE is a manual fallback."
+instruction.TextWrapped = true
+instruction.TextColor3 = Color3.fromRGB(215, 220, 232)
+instruction.Font = Enum.Font.Gotham
+instruction.TextSize = 13
+instruction.Parent = frame
+
+local instructionCorner = Instance.new("UICorner")
+instructionCorner.CornerRadius = UDim.new(0, 7)
+instructionCorner.Parent = instruction
+
+local indicators = Instance.new("TextLabel")
+indicators.Size = UDim2.new(1, -24, 0, 82)
+indicators.Position = UDim2.fromOffset(12, 99)
+indicators.BackgroundColor3 = Color3.fromRGB(16, 18, 23)
+indicators.Text = "SENTRY: NONE\nOWNED: - | TAGGED: - | ACTIVE: -\nTARGET ERROR: -"
+indicators.TextColor3 = Color3.fromRGB(235, 238, 244)
+indicators.TextXAlignment = Enum.TextXAlignment.Left
+indicators.TextYAlignment = Enum.TextYAlignment.Top
+indicators.Font = Enum.Font.Code
+indicators.TextSize = 13
+indicators.Parent = frame
+
+local indicatorsCorner = Instance.new("UICorner")
+indicatorsCorner.CornerRadius = UDim.new(0, 7)
+indicatorsCorner.Parent = indicators
+
+local function makeButton(text, x, y, width, height, color)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.fromOffset(width, height)
+    button.Position = UDim2.fromOffset(x, y)
+    button.BackgroundColor3 = color or Color3.fromRGB(58, 78, 123)
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.Parent = frame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = button
+
+    return button
+end
+
+local captureButton = makeButton("CAPTURE", 12, 190, 126, 42, Color3.fromRGB(45, 139, 91))
+local stopButton = makeButton("STOP", 147, 190, 126, 42, Color3.fromRGB(173, 63, 63))
+local restoreButton = makeButton("RESTORE", 282, 190, 126, 42, Color3.fromRGB(142, 91, 45))
+
+local stepLabel = Instance.new("TextLabel")
+stepLabel.Size = UDim2.fromOffset(52, 32)
+stepLabel.Position = UDim2.fromOffset(12, 241)
+stepLabel.BackgroundTransparency = 1
+stepLabel.Text = "STEP"
+stepLabel.TextColor3 = Color3.fromRGB(210, 215, 225)
+stepLabel.Font = Enum.Font.GothamBold
+stepLabel.TextSize = 12
+stepLabel.Parent = frame
+
+local stepBox = Instance.new("TextBox")
+stepBox.Size = UDim2.fromOffset(66, 34)
+stepBox.Position = UDim2.fromOffset(68, 239)
+stepBox.BackgroundColor3 = Color3.fromRGB(39, 44, 55)
+stepBox.Text = tostring(DEFAULT_STEP)
+stepBox.PlaceholderText = "10"
+stepBox.ClearTextOnFocus = false
+stepBox.TextColor3 = Color3.new(1, 1, 1)
+stepBox.Font = Enum.Font.Code
+stepBox.TextSize = 14
+stepBox.Parent = frame
+
+local stepCorner = Instance.new("UICorner")
+stepCorner.CornerRadius = UDim.new(0, 6)
+stepCorner.Parent = stepBox
+
+local sideLabel = Instance.new("TextLabel")
+sideLabel.Size = UDim2.fromOffset(50, 32)
+sideLabel.Position = UDim2.fromOffset(147, 241)
+sideLabel.BackgroundTransparency = 1
+sideLabel.Text = "SIDE"
+sideLabel.TextColor3 = Color3.fromRGB(210, 215, 225)
+sideLabel.Font = Enum.Font.GothamBold
+sideLabel.TextSize = 12
+sideLabel.Parent = frame
+
+local sideBox = Instance.new("TextBox")
+sideBox.Size = UDim2.fromOffset(66, 34)
+sideBox.Position = UDim2.fromOffset(203, 239)
+sideBox.BackgroundColor3 = Color3.fromRGB(39, 44, 55)
+sideBox.Text = tostring(DEFAULT_SIDE_DISTANCE)
+sideBox.PlaceholderText = "15"
+sideBox.ClearTextOnFocus = false
+sideBox.TextColor3 = Color3.new(1, 1, 1)
+sideBox.Font = Enum.Font.Code
+sideBox.TextSize = 14
+sideBox.Parent = frame
+
+local sideCorner = Instance.new("UICorner")
+sideCorner.CornerRadius = UDim.new(0, 6)
+sideCorner.Parent = sideBox
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.fromOffset(56, 32)
+speedLabel.Position = UDim2.fromOffset(282, 241)
+speedLabel.BackgroundTransparency = 1
+speedLabel.Text = "SPEED"
+speedLabel.TextColor3 = Color3.fromRGB(210, 215, 225)
+speedLabel.Font = Enum.Font.GothamBold
+speedLabel.TextSize = 12
+speedLabel.Parent = frame
+
+local speedBox = Instance.new("TextBox")
+speedBox.Size = UDim2.fromOffset(66, 34)
+speedBox.Position = UDim2.fromOffset(342, 239)
+speedBox.BackgroundColor3 = Color3.fromRGB(39, 44, 55)
+speedBox.Text = tostring(DEFAULT_SPEED)
+speedBox.PlaceholderText = "85"
+speedBox.ClearTextOnFocus = false
+speedBox.TextColor3 = Color3.new(1, 1, 1)
+speedBox.Font = Enum.Font.Code
+speedBox.TextSize = 14
+speedBox.Parent = frame
+
+local speedCorner = Instance.new("UICorner")
+speedCorner.CornerRadius = UDim.new(0, 6)
+speedCorner.Parent = speedBox
+
+local upButton = makeButton("UP", 147, 284, 126, 42)
+local leftButton = makeButton("LEFT", 12, 333, 126, 42)
+local rightButton = makeButton("RIGHT", 282, 333, 126, 42)
+local downButton = makeButton("DOWN", 147, 382, 126, 42)
+local forwardButton = makeButton("FORWARD", 147, 333, 126, 42)
+local backButton = makeButton("BACK", 147, 431, 126, 42)
+
+local besideRightButton = makeButton("TP BESIDE R", 12, 431, 126, 42, Color3.fromRGB(86, 65, 153))
+local besideLeftButton = makeButton("TP BESIDE L", 282, 431, 126, 42, Color3.fromRGB(86, 65, 153))
+
+local copyButton = makeButton("COPY", 12, 482, 126, 36, Color3.fromRGB(65, 94, 159))
+local statusButton = makeButton("STATUS", 147, 482, 126, 36, Color3.fromRGB(55, 110, 120))
+local followButton = makeButton("FOLLOW TP: ON", 282, 482, 126, 36, Color3.fromRGB(69, 114, 78))
+
+local modeButton = makeButton("MODE: SMOOTH", 12, 528, 194, 34, Color3.fromRGB(91, 70, 145))
+local autoCaptureButton = makeButton("AUTO CAPTURE: ON", 214, 528, 194, 34, Color3.fromRGB(57, 119, 111))
+
+local function numberFromBox(box, fallback)
+    local normalized = string.gsub(box.Text, ",", ".")
+    local number = tonumber(normalized)
+    if not number or number ~= number or number == math.huge or number == -math.huge then
+        box.Text = tostring(fallback)
+        return fallback
+    end
+    return math.abs(number)
+end
+
+local function flatUnit(vector, fallback)
+    local flat = Vector3.new(vector.X, 0, vector.Z)
+    if flat.Magnitude < 0.001 then
+        return fallback
+    end
+    return flat.Unit
+end
+
+local function updateIndicators(message)
+    local sentry = state.sentry
+    local root = state.root
+
+    if not sentry or not root or not sentry.Parent or not root.Parent then
+        indicators.Text = (message and (message .. "\n") or "")
+            .. "SENTRY: NONE\nOWNED: - | TAGGED: - | ACTIVE: -\nTARGET ERROR: -"
+        indicators.TextColor3 = Color3.fromRGB(235, 238, 244)
+        return
+    end
+
+    local owner = ownsPhysics(root)
+    local tagged = CollectionService:HasTag(sentry, "Sentry")
+    local active = hasActiveTouch(sentry)
+    local targetError = state.targetPosition
+        and (state.targetPosition - root.Position).Magnitude
+        or 0
+
+    local controllerState = state.pausedForOwnership
+        and "PAUSED — WAITING FOR OWNERSHIP"
+        or (state.controlling and "HOLDING" or "STOPPED")
+    local firstLine = message
+        or string.format(
+            "%s | %s @ %.1f",
+            controllerState,
+            state.movementMode,
+            numberFromBox(speedBox, DEFAULT_SPEED)
+        )
+    indicators.Text = string.format(
+        "%s\nSENTRY: %s\nOWNED: %s | TAGGED: %s | ACTIVE: %s\nTARGET ERROR: %.2f",
+        firstLine,
+        sentry.Name,
+        tostring(owner),
+        tostring(tagged),
+        tostring(active),
+        targetError
+    )
+
+    indicators.TextColor3 = owner == false
+        and Color3.fromRGB(255, 119, 119)
+        or Color3.fromRGB(117, 255, 164)
+end
+
+local function captureSpecific(sentry, root, distance, source)
+    if not sentry or not sentry.Parent then
+        return false
+    end
+
+    if getOwnerId(sentry) ~= LocalPlayer.UserId then
+        return false
+    end
+
+    root = root or getSentryRoot(sentry)
+    if not root or not root.Parent or root.Anchored then
+        return false
+    end
+
+    root = root.AssemblyRootPart or root
+
+    if state.sentry == sentry
+        and state.root == root
+        and state.sentry.Parent
+        and state.root.Parent then
+        return true
+    end
+
+    stopController(true)
+
+    local characterRoot = getCharacterRoot()
+    distance = distance
+        or (characterRoot and (root.Position - characterRoot.Position).Magnitude)
+        or -1
+
+    state.sentry = sentry
+    state.root = root
+    state.initialPosition = root.Position
+    state.originalPosition = root.Position
+    state.targetPosition = root.Position
+    state.originalPlayerYOffset = characterRoot
+        and (root.Position.Y - characterRoot.Position.Y)
+        or -3
+    state.lastCharacterPosition = characterRoot and characterRoot.Position or nil
+
+    log("=== ENGINEER 3D DEMO CAPTURE ===")
+    log("SOURCE:", source or "MANUAL")
+    log("PLAYER:", LocalPlayer.Name, LocalPlayer.UserId)
+    log("PRIVATE MARKER:", game.PrivateServerId ~= "" and "TRUE" or "UNKNOWN")
+    log("SENTRY:", pathOf(sentry))
+    log("ROOT:", pathOf(root))
+    log("OWNER ID:", getOwnerId(sentry))
+    log("DISTANCE:", string.format("%.3f", distance))
+    log("NETWORK OWNER:", ownsPhysics(root))
+    log("ORIGINAL POSITION:", state.originalPosition)
+    log("PLAYER Y OFFSET:", state.originalPlayerYOffset)
+
+    updateIndicators("AUTO CAPTURED — READY")
+    return true
+end
+
+local function captureNearest(source)
+    local sentry, root, distance = findNearestOwnedSentry()
+    if not sentry or not root then
+        if not state.sentry or not state.sentry.Parent then
+            state.sentry = nil
+            state.root = nil
+        end
+        updateIndicators("PLACE A TURRET — AUTO CAPTURE WAITING")
+        if source == "MANUAL" then
+            log("CAPTURE REJECTED: OWNED SENTRY NOT FOUND")
+        end
+        return false
+    end
+
+    return captureSpecific(sentry, root, distance, source or "NEAREST")
+end
+
+local function ensureReady()
+    if not state.sentry
+        or not state.root
+        or not state.sentry.Parent
+        or not state.root.Parent then
+        updateIndicators("CAPTURE A LIVE SENTRY FIRST")
+        return false
+    end
+
+    if getOwnerId(state.sentry) ~= LocalPlayer.UserId then
+        updateIndicators("REJECTED: NOT YOUR SENTRY")
+        return false
+    end
+
+    local owner = ownsPhysics(state.root)
+    if owner == false then
+        updateIndicators("REJECTED: NETWORK OWNER FALSE")
+        log("MOVE REJECTED: NETWORK OWNER FALSE")
+        return false
+    end
+
+    if not saveAndNeutralizeBodyVelocities() then
+        updateIndicators("REJECTED: BODYVELOCITY NOT FOUND")
+        return false
+    end
+
+    return true
+end
+
+local function setTarget(target, actionName, forceSnap)
+    if not ensureReady() then
+        return
+    end
+
+    state.targetPosition = target
+    state.controlling = true
+    state.returning = false
+    state.returnStableSince = nil
+    state.ownershipLostAt = nil
+    state.pausedForOwnership = false
+
+    local useSnap = forceSnap == true or state.movementMode == "SNAP"
+    if useSnap then
+        snapRootTo(target)
+    end
+
+    log("ACTION:", actionName)
+    log("FROM:", state.root.Position)
+    log("TARGET:", target)
+    log("MOVE MODE:", useSnap and "SNAP" or "SMOOTH")
+    log("SPEED:", numberFromBox(speedBox, DEFAULT_SPEED))
+    log("NETWORK OWNER:", ownsPhysics(state.root))
+    updateIndicators(actionName .. (useSnap and " [SNAP]" or " [SMOOTH]"))
+end
+
+local function moveByDirection(directionName)
+    local characterRoot = getCharacterRoot()
+    if not characterRoot then
+        updateIndicators("CHARACTER ROOT NOT FOUND")
+        return
+    end
+
+    local step = numberFromBox(stepBox, DEFAULT_STEP)
+    local forward = flatUnit(characterRoot.CFrame.LookVector, Vector3.new(0, 0, -1))
+    local right = flatUnit(characterRoot.CFrame.RightVector, Vector3.new(1, 0, 0))
+
+    local directions = {
+        UP = Vector3.new(0, 1, 0),
+        DOWN = Vector3.new(0, -1, 0),
+        LEFT = -right,
+        RIGHT = right,
+        FORWARD = forward,
+        BACK = -forward,
+    }
+
+    local direction = directions[directionName]
+    if not direction then
+        return
+    end
+
+    local basePosition = state.targetPosition
+        or (state.root and state.root.Position)
+
+    if not basePosition then
+        updateIndicators("CAPTURE A SENTRY FIRST")
+        return
+    end
+
+    setTarget(basePosition + direction * step, directionName .. " " .. tostring(step))
+end
+
+local function moveBeside(side)
+    local characterRoot = getCharacterRoot()
+    if not characterRoot then
+        updateIndicators("CHARACTER ROOT NOT FOUND")
+        return
+    end
+
+    if not state.root or not state.originalPlayerYOffset then
+        updateIndicators("CAPTURE A SENTRY FIRST")
+        return
+    end
+
+    local distance = numberFromBox(sideBox, DEFAULT_SIDE_DISTANCE)
+    local right = flatUnit(characterRoot.CFrame.RightVector, Vector3.new(1, 0, 0))
+    local sign = side == "RIGHT" and 1 or -1
+
+    local target = characterRoot.Position
+        + right * distance * sign
+        + Vector3.new(0, state.originalPlayerYOffset, 0)
+
+    setTarget(target, "TP BESIDE " .. side .. " " .. tostring(distance), true)
+end
+
+local function beginRestore()
+    if not state.root or not state.root.Parent or not state.originalPosition then
+        updateIndicators("NOTHING TO RESTORE")
+        return
+    end
+
+    if not ensureReady() then
+        return
+    end
+
+    state.targetPosition = state.originalPosition
+    state.controlling = true
+    state.returning = true
+    state.returnStableSince = nil
+    state.ownershipLostAt = nil
+    state.pausedForOwnership = false
+
+    if state.movementMode == "SNAP" then
+        snapRootTo(state.originalPosition)
+    end
+
+    log("ACTION: RESTORE TO", state.originalPosition)
+    updateIndicators("RETURNING TO ORIGINAL")
+end
+
+captureButton.MouseButton1Click:Connect(function()
+    captureNearest("MANUAL")
+end)
+stopButton.MouseButton1Click:Connect(function()
+    log("ACTION: STOP")
+    stopController(true)
+    updateIndicators("STOPPED — FORCES RESTORED")
+end)
+restoreButton.MouseButton1Click:Connect(beginRestore)
+
+upButton.MouseButton1Click:Connect(function()
+    moveByDirection("UP")
+end)
+downButton.MouseButton1Click:Connect(function()
+    moveByDirection("DOWN")
+end)
+leftButton.MouseButton1Click:Connect(function()
+    moveByDirection("LEFT")
+end)
+rightButton.MouseButton1Click:Connect(function()
+    moveByDirection("RIGHT")
+end)
+forwardButton.MouseButton1Click:Connect(function()
+    moveByDirection("FORWARD")
+end)
+backButton.MouseButton1Click:Connect(function()
+    moveByDirection("BACK")
+end)
+
+besideRightButton.MouseButton1Click:Connect(function()
+    moveBeside("RIGHT")
+end)
+besideLeftButton.MouseButton1Click:Connect(function()
+    moveBeside("LEFT")
+end)
+
+copyButton.MouseButton1Click:Connect(function()
+    local copied = copyReport()
+    updateIndicators(copied and "REPORT COPIED" or "CLIPBOARD UNAVAILABLE")
+end)
+
+statusButton.MouseButton1Click:Connect(function()
+    updateIndicators("MANUAL STATUS REFRESH")
+    if state.root and state.root.Parent then
+        log("STATUS POSITION:", state.root.Position)
+        log("STATUS TARGET:", state.targetPosition)
+        log("STATUS OWNER:", ownsPhysics(state.root))
+        log("STATUS TAGGED:", CollectionService:HasTag(state.sentry, "Sentry"))
+        log("STATUS ACTIVE:", hasActiveTouch(state.sentry))
+        log("STATUS MODE:", state.movementMode)
+        log("STATUS SPEED:", numberFromBox(speedBox, DEFAULT_SPEED))
+        log("STATUS FOLLOW TP:", state.followTeleport)
+        log("STATUS AUTO CAPTURE:", state.autoCapture)
+    end
+end)
+
+followButton.MouseButton1Click:Connect(function()
+    state.followTeleport = not state.followTeleport
+    followButton.Text = state.followTeleport and "FOLLOW TP: ON" or "FOLLOW TP: OFF"
+    followButton.BackgroundColor3 = state.followTeleport
+        and Color3.fromRGB(69, 114, 78)
+        or Color3.fromRGB(92, 72, 72)
+
+    local characterRoot = getCharacterRoot()
+    state.lastCharacterPosition = characterRoot and characterRoot.Position or nil
+    log("FOLLOW TP:", state.followTeleport)
+    updateIndicators(state.followTeleport and "FOLLOW TP ENABLED" or "FOLLOW TP DISABLED")
+end)
+
+modeButton.MouseButton1Click:Connect(function()
+    state.movementMode = state.movementMode == "SMOOTH" and "SNAP" or "SMOOTH"
+    modeButton.Text = "MODE: " .. state.movementMode
+    modeButton.BackgroundColor3 = state.movementMode == "SMOOTH"
+        and Color3.fromRGB(91, 70, 145)
+        or Color3.fromRGB(154, 88, 52)
+
+    if state.movementMode == "SNAP"
+        and state.controlling
+        and state.targetPosition then
+        snapRootTo(state.targetPosition)
+    end
+
+    log("MOVEMENT MODE:", state.movementMode)
+    updateIndicators("MODE CHANGED: " .. state.movementMode)
+end)
+
+autoCaptureButton.MouseButton1Click:Connect(function()
+    state.autoCapture = not state.autoCapture
+    autoCaptureButton.Text = state.autoCapture
+        and "AUTO CAPTURE: ON"
+        or "AUTO CAPTURE: OFF"
+    autoCaptureButton.BackgroundColor3 = state.autoCapture
+        and Color3.fromRGB(57, 119, 111)
+        or Color3.fromRGB(92, 72, 72)
+
+    log("AUTO CAPTURE:", state.autoCapture)
+    if state.autoCapture then
+        captureNearest("AUTO TOGGLE")
+    else
+        updateIndicators("AUTO CAPTURE DISABLED")
+    end
+end)
+
+speedBox.FocusLost:Connect(function()
+    local speed = numberFromBox(speedBox, DEFAULT_SPEED)
+    log("SPEED SET:", speed)
+    updateIndicators("SPEED SET: " .. tostring(speed))
+end)
+
+local heartbeatConnection
+heartbeatConnection = RunService.Heartbeat:Connect(function()
+    if state.closed then
+        return
+    end
+
+    if not state.controlling then
+        return
+    end
+
+    local sentry = state.sentry
+    local root = state.root
+    local target = state.targetPosition
+
+    if not sentry or not root or not target or not sentry.Parent or not root.Parent then
+        log("CONTROLLER STOPPED: SENTRY DESTROYED")
+        stopController(true)
+        updateIndicators("SENTRY DESTROYED")
+        return
+    end
+
+    if getOwnerId(sentry) ~= LocalPlayer.UserId then
+        log("CONTROLLER STOPPED: OWNER ID CHANGED")
+        stopController(true)
+        updateIndicators("OWNER ID CHANGED")
+        return
+    end
+
+    if networkOwnerFunction and ownsPhysics(root) == false then
+        state.ownershipLostAt = state.ownershipLostAt or os.clock()
+
+        if os.clock() - state.ownershipLostAt < OWNERSHIP_GRACE_SECONDS then
+            updateIndicators("OWNERSHIP TRANSIENT — WAITING")
+            return
+        end
+
+        log("CONTROLLER PAUSED: NETWORK OWNERSHIP LOST")
+        state.controlling = false
+        state.pausedForOwnership = true
+        restoreBodyVelocities()
+        updateIndicators("PAUSED — MOVE CLOSER; AUTO RESUME")
+        return
+    elseif state.ownershipLostAt then
+        log("NETWORK OWNERSHIP RECOVERED DURING GRACE")
+        state.ownershipLostAt = nil
+    end
+
+    -- Re-apply the local neutralization in case the physics object updates.
+    saveAndNeutralizeBodyVelocities()
+
+    local errorVector = target - root.Position
+    local distance = errorVector.Magnitude
+
+    if state.movementMode == "SNAP" then
+        if distance > 0.035 then
+            snapRootTo(target)
+        else
+            zeroWholeSentryVelocity()
+        end
+    else
+        local desiredVelocity = Vector3.zero
+
+        if distance > 0.025 then
+            local configuredSpeed = numberFromBox(speedBox, DEFAULT_SPEED)
+            local speed = math.min(
+                configuredSpeed,
+                math.max(0.8, distance * POSITION_GAIN)
+            )
+            desiredVelocity = errorVector.Unit * speed
+        end
+
+        root.AssemblyLinearVelocity = desiredVelocity
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    if state.returning then
+        if distance <= 0.18 then
+            state.returnStableSince = state.returnStableSince or os.clock()
+
+            if os.clock() - state.returnStableSince >= 0.4 then
+                log("RESTORE COMPLETE; ERROR:", string.format("%.3f", distance))
+                stopController(true)
+                updateIndicators("RESTORED — FORCES RESTORED")
+            end
+        else
+            state.returnStableSince = nil
+        end
+    end
+end)
+
+local function hasLiveCapturedSentry()
+    return state.sentry ~= nil
+        and state.root ~= nil
+        and state.sentry.Parent ~= nil
+        and state.root.Parent ~= nil
+        and getOwnerId(state.sentry) == LocalPlayer.UserId
+end
+
+local statusAccumulator = 0
+local autoScanAccumulator = 0
+local statusConnection
+statusConnection = RunService.Heartbeat:Connect(function(deltaTime)
+    if state.closed then
+        return
+    end
+
+    statusAccumulator = statusAccumulator + deltaTime
+    autoScanAccumulator = autoScanAccumulator + deltaTime
+
+    if state.pausedForOwnership
+        and hasLiveCapturedSentry()
+        and ownsPhysics(state.root) ~= false then
+
+        if saveAndNeutralizeBodyVelocities() then
+            state.pausedForOwnership = false
+            state.ownershipLostAt = nil
+            state.controlling = true
+            log("CONTROLLER AUTO RESUMED: NETWORK OWNERSHIP RETURNED")
+            updateIndicators("AUTO RESUMED")
+        end
+    end
+
+    if autoScanAccumulator >= 0.5 then
+        autoScanAccumulator = 0
+
+        if state.autoCapture and not hasLiveCapturedSentry() then
+            captureNearest("AUTO SCAN")
+        end
+    end
+
+    if statusAccumulator >= 0.2 then
+        statusAccumulator = 0
+        updateIndicators()
+    end
+end)
+
+local tagConnection = CollectionService:GetInstanceAddedSignal("Sentry"):Connect(function(sentry)
+    task.spawn(function()
+        local deadline = os.clock() + 4
+
+        repeat
+            if state.closed or not state.autoCapture or not sentry.Parent then
+                return
+            end
+
+            local root = getSentryRoot(sentry)
+            if getOwnerId(sentry) == LocalPlayer.UserId and root then
+                local characterRoot = getCharacterRoot()
+                local distance = characterRoot
+                    and ((root.AssemblyRootPart or root).Position - characterRoot.Position).Magnitude
+                    or -1
+
+                captureSpecific(
+                    sentry,
+                    root.AssemblyRootPart or root,
+                    distance,
+                    "AUTO TAG"
+                )
+                return
+            end
+
+            task.wait(0.05)
+        until os.clock() >= deadline
+    end)
+end)
+
+local function followCharacterTeleport()
+    if state.closed then
+        return
+    end
+
+    local characterRoot = getCharacterRoot()
+    if not characterRoot then
+        state.lastCharacterPosition = nil
+        return
+    end
+
+    local currentPosition = characterRoot.Position
+    local previousPosition = state.lastCharacterPosition
+    state.lastCharacterPosition = currentPosition
+
+    if not state.followTeleport or not previousPosition then
+        return
+    end
+
+    local delta = currentPosition - previousPosition
+    if delta.Magnitude < TELEPORT_THRESHOLD then
+        return
+    end
+
+    if not hasLiveCapturedSentry() then
+        return
+    end
+
+    local root = state.root
+    local ownerBefore = ownsPhysics(root)
+    local destination = root.Position + delta
+    local moved = snapRootTo(destination)
+
+    if moved then
+        if state.targetPosition then
+            state.targetPosition = state.targetPosition + delta
+        end
+        if state.originalPosition then
+            state.originalPosition = state.originalPosition + delta
+        end
+
+        state.ownershipLostAt = nil
+        log("FOLLOW TP SHIFT:", delta)
+        log("FOLLOW TP DISTANCE:", string.format("%.3f", delta.Magnitude))
+        log("FOLLOW TP OWNER BEFORE:", ownerBefore)
+        log("FOLLOW TP OWNER AFTER:", ownsPhysics(root))
+        updateIndicators("FOLLOW TP MOVED SENTRY")
+    else
+        log("FOLLOW TP FAILED: ROOT MOVE ERROR")
+        updateIndicators("FOLLOW TP FAILED")
+    end
+end
+
+local teleportRootConnection
+local function bindTeleportRoot(character)
+    if teleportRootConnection then
+        teleportRootConnection:Disconnect()
+        teleportRootConnection = nil
+    end
+
+    task.spawn(function()
+        local root = character and character:WaitForChild("HumanoidRootPart", 10)
+        if state.closed or not root or character ~= LocalPlayer.Character then
+            return
+        end
+
+        state.lastCharacterPosition = root.Position
+        teleportRootConnection = root:GetPropertyChangedSignal("CFrame"):Connect(
+            followCharacterTeleport
+        )
+    end)
+end
+
+bindTeleportRoot(LocalPlayer.Character)
+
+local teleportConnection = RunService.PreSimulation:Connect(function()
+    followCharacterTeleport()
+end)
+
+local characterConnection = LocalPlayer.CharacterAdded:Connect(function(character)
+    stopController(true)
+    state.sentry = nil
+    state.root = nil
+    state.initialPosition = nil
+    state.originalPosition = nil
+    state.targetPosition = nil
+    state.originalPlayerYOffset = nil
+    state.bodyVelocities = nil
+    state.lastCharacterPosition = nil
+    bindTeleportRoot(character)
+    updateIndicators("RESPAWNED — AUTO CAPTURE WAITING")
+end)
+
+local function cleanup()
+    if state.closed then
+        return
+    end
+
+    state.closed = true
+    stopController(true)
+
+    if heartbeatConnection then
+        heartbeatConnection:Disconnect()
+    end
+    if statusConnection then
+        statusConnection:Disconnect()
+    end
+    if tagConnection then
+        tagConnection:Disconnect()
+    end
+    if teleportConnection then
+        teleportConnection:Disconnect()
+    end
+    if teleportRootConnection then
+        teleportRootConnection:Disconnect()
+    end
+    if characterConnection then
+        characterConnection:Disconnect()
+    end
+
+    if gui and gui.Parent then
+        gui:Destroy()
+    end
+
+    if shared.SBEngineer3DDemoCleanup == cleanup then
+        shared.SBEngineer3DDemoCleanup = nil
+    end
+end
+
+shared.SBEngineer3DDemoCleanup = cleanup
+
+closeButton.MouseButton1Click:Connect(cleanup)
+
+log("=== ENGINEER 3D DEMO GUI V3.1 LOADED ===")
+log("PLAYER:", LocalPlayer.Name, LocalPlayer.UserId)
+log("PRIVATE MARKER:", game.PrivateServerId ~= "" and "TRUE" or "UNKNOWN")
+log("SCOPE: OWN SENTRY ONLY")
+log("AUTO CAPTURE: ON")
+log("FOLLOW TP: ON")
+log("DEFAULT MODE: SMOOTH")
+log("DEFAULT SPEED:", DEFAULT_SPEED)
+
+task.delay(0.2, function()
+    if gui.Parent then
+        captureNearest("STARTUP AUTO")
+    end
+end)
