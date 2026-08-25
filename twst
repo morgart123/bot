@@ -1,0 +1,1873 @@
+-- SB ENGINEER DEEP COLLECTOR V1
+-- Focused, crash-resistant collector for the Engineer glove.
+-- It does not send, replace, suppress, or modify any remote arguments.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local ScriptContext = game:GetService("ScriptContext")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+assert(LocalPlayer, "LocalPlayer is unavailable")
+
+local ENV = getgenv and getgenv() or _G
+
+if type(ENV.SB_ENGINEER_PROFILER_STOP) == "function" then
+    pcall(ENV.SB_ENGINEER_PROFILER_STOP)
+end
+
+if type(ENV.SB_ENGINEER_DEEP_STOP) == "function" then
+    pcall(ENV.SB_ENGINEER_DEEP_STOP)
+end
+
+for _, oldName in ipairs({
+    "SB_EngineerProfiler",
+    "SB_EngineerDeepCollector"
+}) do
+    local old = CoreGui:FindFirstChild(oldName)
+    if old then
+        old:Destroy()
+    end
+end
+
+local START_CLOCK = os.clock()
+local FILE_NAME = "SB_ENGINEER_DEEP_REPORT_"
+    .. os.date("!%Y%m%d_%H%M%S")
+    .. ".txt"
+
+local HAS_WRITEFILE = type(writefile) == "function"
+local HAS_APPENDFILE = type(appendfile) == "function"
+local HAS_READFILE = type(readfile) == "function"
+local HAS_SETCLIPBOARD = type(setclipboard or toclipboard) == "function"
+
+local stopped = false
+local connections = {}
+local watchedModels = {}
+local watchedPlayerDataValues = {}
+local pendingLines = {}
+local pendingBytes = 0
+local fallbackFile = ""
+local recentLines = {}
+local lastPreview
+local lastPreviewState
+local lastSentryCall
+local oldNamecall
+local hookInstalled = false
+local StatusLabel
+local LogLabel
+
+local function elapsed()
+    return os.clock() - START_CLOCK
+end
+
+local function safeFullName(object)
+    if typeof(object) ~= "Instance" then
+        return tostring(object)
+    end
+
+    local success, result = pcall(function()
+        return object:GetFullName()
+    end)
+
+    return success and result or (object.ClassName .. ":" .. object.Name)
+end
+
+local function safeProperty(object, property)
+    local success, result = pcall(function()
+        return object[property]
+    end)
+
+    if success then
+        return result
+    end
+
+    return "<unavailable>"
+end
+
+local function cframeString(value)
+    local components = {value:GetComponents()}
+
+    for index, component in ipairs(components) do
+        components[index] = string.format("%.9g", component)
+    end
+
+    return "CFrame(" .. table.concat(components, ",") .. ")"
+end
+
+local function valueString(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+
+    local valueType = typeof(value)
+
+    if valueType == "Instance" then
+        return "<" .. value.ClassName .. ":" .. safeFullName(value) .. ">"
+    elseif valueType == "CFrame" then
+        return cframeString(value)
+    elseif valueType == "Vector3"
+        or valueType == "Vector2"
+        or valueType == "Color3"
+        or valueType == "UDim"
+        or valueType == "UDim2"
+        or valueType == "Ray"
+        or valueType == "EnumItem"
+        or valueType == "NumberRange"
+        or valueType == "NumberSequence"
+        or valueType == "ColorSequence" then
+
+        return tostring(value)
+    elseif valueType == "RaycastParams" then
+        local filter = {}
+
+        for _, object in ipairs(value.FilterDescendantsInstances) do
+            table.insert(filter, safeFullName(object))
+        end
+
+        return "RaycastParams{FilterType="
+            .. tostring(value.FilterType)
+            .. ",IgnoreWater="
+            .. tostring(value.IgnoreWater)
+            .. ",CollisionGroup="
+            .. tostring(value.CollisionGroup)
+            .. ",Filter={"
+            .. table.concat(filter, ",")
+            .. "}}"
+    elseif valueType == "OverlapParams" then
+        local filter = {}
+
+        for _, object in ipairs(value.FilterDescendantsInstances) do
+            table.insert(filter, safeFullName(object))
+        end
+
+        return "OverlapParams{FilterType="
+            .. tostring(value.FilterType)
+            .. ",MaxParts="
+            .. tostring(value.MaxParts)
+            .. ",CollisionGroup="
+            .. tostring(value.CollisionGroup)
+            .. ",Filter={"
+            .. table.concat(filter, ",")
+            .. "}}"
+    elseif valueType == "function" then
+        local description = "function"
+
+        if debug and type(debug.info) == "function" then
+            local success, source, line, name = pcall(
+                debug.info,
+                value,
+                "sln"
+            )
+
+            if success then
+                description = string.format(
+                    "function{source=%s,line=%s,name=%s}",
+                    tostring(source),
+                    tostring(line),
+                    tostring(name)
+                )
+            end
+        end
+
+        return description
+    elseif valueType == "table" then
+        if seen[value] then
+            return "<recursive-table>"
+        end
+
+        if depth >= 2 then
+            local count = 0
+            for _ in pairs(value) do
+                count += 1
+            end
+            return "<table entries=" .. count .. ">"
+        end
+
+        seen[value] = true
+        local entries = {}
+
+        for key, child in pairs(value) do
+            table.insert(
+                entries,
+                "["
+                    .. valueString(key, depth + 1, seen)
+                    .. "]="
+                    .. valueString(child, depth + 1, seen)
+            )
+        end
+
+        table.sort(entries)
+        seen[value] = nil
+        return "{" .. table.concat(entries, ",") .. "}"
+    elseif valueType == "string" then
+        return string.format("%q", value)
+    end
+
+    return tostring(value)
+end
+
+local function updateDisplay(line)
+    table.insert(recentLines, line)
+
+    while #recentLines > 180 do
+        table.remove(recentLines, 1)
+    end
+
+    if LogLabel then
+        LogLabel.Text = table.concat(recentLines, "\n")
+    end
+end
+
+local function flush()
+    if #pendingLines == 0 then
+        return
+    end
+
+    local chunk = table.concat(pendingLines, "\n") .. "\n"
+    table.clear(pendingLines)
+    pendingBytes = 0
+
+    if HAS_APPENDFILE then
+        pcall(appendfile, FILE_NAME, chunk)
+    elseif HAS_WRITEFILE then
+        fallbackFile ..= chunk
+        pcall(writefile, FILE_NAME, fallbackFile)
+    else
+        fallbackFile ..= chunk
+    end
+end
+
+local function writeLine(kind, ...)
+    local values = {...}
+
+    for index, value in ipairs(values) do
+        values[index] = valueString(value)
+    end
+
+    local line = string.format("%s\t%.3f\t%s", kind, elapsed(), table.concat(values, "\t"))
+    table.insert(pendingLines, line)
+    pendingBytes += #line + 1
+    updateDisplay(line)
+    print(line)
+
+    if #pendingLines >= 40 or pendingBytes >= 32768 then
+        flush()
+    end
+end
+
+local function writeRawBlock(label, text)
+    flush()
+    text = tostring(text or "")
+
+    local header = string.format(
+        "BEGIN_%s\t%.3f\tbytes=%d\n",
+        label,
+        elapsed(),
+        #text
+    )
+    local footer = string.format("\nEND_%s\t%.3f\n", label, elapsed())
+    local block = header .. text .. footer
+
+    if HAS_APPENDFILE then
+        local position = 1
+        local chunkSize = 65536
+
+        while position <= #block do
+            pcall(
+                appendfile,
+                FILE_NAME,
+                block:sub(position, position + chunkSize - 1)
+            )
+            position += chunkSize
+            task.wait()
+        end
+    elseif HAS_WRITEFILE then
+        fallbackFile ..= block
+        pcall(writefile, FILE_NAME, fallbackFile)
+    else
+        fallbackFile ..= block
+    end
+end
+
+if HAS_WRITEFILE then
+    pcall(writefile, FILE_NAME, "")
+end
+
+writeLine("BEGIN_REPORT", "collector=SB_ENGINEER_DEEP_V1")
+writeLine("SESSION", "PlaceId=" .. game.PlaceId, "JobId=" .. game.JobId)
+writeLine("SESSION", "PrivateServer=" .. tostring(game.PrivateServerId ~= ""))
+writeLine("SESSION", "LocalPlayer=" .. LocalPlayer.Name, "UserId=" .. LocalPlayer.UserId)
+writeLine("SESSION", "scope=client-visible plus observed server replication")
+writeLine("SESSION", "server-only source directly readable=false")
+writeLine(
+    "FILE_CAPS",
+    "writefile=" .. tostring(HAS_WRITEFILE),
+    "appendfile=" .. tostring(HAS_APPENDFILE),
+    "readfile=" .. tostring(HAS_READFILE),
+    "clipboard=" .. tostring(HAS_SETCLIPBOARD)
+)
+
+local function addConnection(connection)
+    if connection then
+        table.insert(connections, connection)
+    end
+    return connection
+end
+
+local function getCharacter()
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    return character, root, humanoid
+end
+
+local function findEngineerTool()
+    local character = LocalPlayer.Character
+
+    return (character and character:FindFirstChild("Engineer"))
+        or LocalPlayer.Backpack:FindFirstChild("Engineer")
+end
+
+local function findEngineerScript()
+    local tool = findEngineerTool()
+
+    if not tool then
+        return nil
+    end
+
+    for _, object in ipairs(tool:GetDescendants()) do
+        if object:IsA("LocalScript") then
+            return object
+        end
+    end
+
+    return nil
+end
+
+local function attributesString(object)
+    local attributes = object:GetAttributes()
+    local entries = {}
+
+    for key, value in pairs(attributes) do
+        table.insert(entries, tostring(key) .. "=" .. valueString(value))
+    end
+
+    table.sort(entries)
+    return "{" .. table.concat(entries, ",") .. "}"
+end
+
+local function tagsString(object)
+    local success, tags = pcall(CollectionService.GetTags, CollectionService, object)
+
+    if not success then
+        return "{}"
+    end
+
+    table.sort(tags)
+    return "{" .. table.concat(tags, ",") .. "}"
+end
+
+local function instanceProperties(object)
+    local fields = {}
+
+    local function add(key, value)
+        table.insert(fields, key .. "=" .. valueString(value))
+    end
+
+    if object:IsA("BasePart") then
+        add("CFrame", object.CFrame)
+        add("Size", object.Size)
+        add("Anchored", object.Anchored)
+        add("CanCollide", object.CanCollide)
+        add("CanTouch", object.CanTouch)
+        add("CanQuery", object.CanQuery)
+        add("Transparency", object.Transparency)
+        add("Material", object.Material)
+        add("CollisionGroup", object.CollisionGroup)
+        add("Massless", object.Massless)
+        add("AssemblyRootPart", object.AssemblyRootPart)
+        add("AssemblyMass", object.AssemblyMass)
+        add("AssemblyLinearVelocity", object.AssemblyLinearVelocity)
+        add("AssemblyAngularVelocity", object.AssemblyAngularVelocity)
+        add("ReceiveAge", safeProperty(object, "ReceiveAge"))
+        add("NetworkOwnershipRule", safeProperty(object, "NetworkOwnershipRule"))
+
+        local ownerFunction = rawget(ENV, "isnetworkowner") or _G.isnetworkowner
+        if type(ownerFunction) == "function" then
+            local success, owned = pcall(ownerFunction, object)
+            add("IsNetworkOwner", success and owned or "error")
+        end
+    elseif object:IsA("Model") then
+        local success, pivot = pcall(object.GetPivot, object)
+        add("Pivot", success and pivot or "unavailable")
+        add("PrimaryPart", object.PrimaryPart)
+        add("Scale", safeProperty(object, "Scale"))
+    elseif object:IsA("ValueBase") then
+        add("Value", object.Value)
+    elseif object:IsA("Attachment") then
+        add("CFrame", object.CFrame)
+        add("WorldCFrame", object.WorldCFrame)
+    elseif object:IsA("Constraint") then
+        add("Enabled", object.Enabled)
+        add("Attachment0", safeProperty(object, "Attachment0"))
+        add("Attachment1", safeProperty(object, "Attachment1"))
+    elseif object:IsA("WeldConstraint") then
+        add("Enabled", object.Enabled)
+        add("Part0", object.Part0)
+        add("Part1", object.Part1)
+    elseif object:IsA("BodyMover") then
+        add("Velocity", safeProperty(object, "Velocity"))
+        add("AngularVelocity", safeProperty(object, "AngularVelocity"))
+        add("MaxForce", safeProperty(object, "MaxForce"))
+        add("MaxTorque", safeProperty(object, "MaxTorque"))
+        add("P", safeProperty(object, "P"))
+    elseif object:IsA("Sound") then
+        add("SoundId", object.SoundId)
+        add("Playing", object.Playing)
+        add("Looped", object.Looped)
+        add("Volume", object.Volume)
+        add("PlaybackSpeed", object.PlaybackSpeed)
+    elseif object:IsA("ParticleEmitter") then
+        add("Enabled", object.Enabled)
+        add("Rate", object.Rate)
+        add("Lifetime", object.Lifetime)
+        add("Texture", object.Texture)
+    elseif object:IsA("Tool") then
+        add("Enabled", object.Enabled)
+        add("RequiresHandle", object.RequiresHandle)
+        add("CanBeDropped", object.CanBeDropped)
+        add("Grip", object.Grip)
+    elseif object:IsA("GuiObject") then
+        add("Visible", object.Visible)
+        add("Active", object.Active)
+        add("Position", object.Position)
+        add("Size", object.Size)
+    elseif object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
+        add("ClassName", object.ClassName)
+    elseif object:IsA("LuaSourceContainer") then
+        add("Enabled", safeProperty(object, "Enabled"))
+        add("RunContext", safeProperty(object, "RunContext"))
+    end
+
+    return "{" .. table.concat(fields, ",") .. "}"
+end
+
+local function dumpTree(root, label)
+    if not root then
+        writeLine("TREE_MISSING", label)
+        return
+    end
+
+    writeLine("BEGIN_TREE", label, root)
+
+    local objects = {root}
+    for _, descendant in ipairs(root:GetDescendants()) do
+        table.insert(objects, descendant)
+    end
+
+    for _, object in ipairs(objects) do
+        writeLine(
+            "OBJ",
+            "path=" .. safeFullName(object),
+            "class=" .. object.ClassName,
+            "name=" .. object.Name,
+            "attributes=" .. attributesString(object),
+            "tags=" .. tagsString(object),
+            "properties=" .. instanceProperties(object)
+        )
+        task.wait()
+    end
+
+    writeLine("END_TREE", label, "objects=" .. #objects)
+end
+
+local function getAllowedGrass()
+    local result = {}
+    local arena = Workspace:FindFirstChild("Arena")
+
+    if not arena then
+        return result
+    end
+
+    for _, islandName in ipairs({
+        "main island",
+        "island1",
+        "island2",
+        "island3",
+        "island4"
+    }) do
+        local island = arena:FindFirstChild(islandName)
+        local grass = island and island:FindFirstChild("Grass")
+
+        if grass and grass:IsA("BasePart") then
+            table.insert(result, grass)
+        end
+    end
+
+    local defaultIsland = arena:FindFirstChild("default island")
+
+    if defaultIsland then
+        for _, object in ipairs(defaultIsland:GetChildren()) do
+            if object:IsA("BasePart") and object.Material == Enum.Material.Grass then
+                table.insert(result, object)
+            end
+        end
+    end
+
+    return result
+end
+
+local function evaluatePlacementCFrame(targetCFrame)
+    local character, root, humanoid = getCharacter()
+    local allowedGrass = getAllowedGrass()
+    local grassParams = RaycastParams.new()
+    grassParams.FilterType = Enum.RaycastFilterType.Include
+    grassParams.FilterDescendantsInstances = allowedGrass
+    grassParams.IgnoreWater = true
+
+    local grassHit = Workspace:Raycast(
+        targetCFrame.Position + Vector3.new(0, 10, 0),
+        Vector3.new(0, -50, 0),
+        grassParams
+    )
+
+    local worldParams = RaycastParams.new()
+    worldParams.FilterType = Enum.RaycastFilterType.Exclude
+    worldParams.FilterDescendantsInstances = character and {character} or {}
+    worldParams.IgnoreWater = true
+
+    local worldHit = Workspace:Raycast(
+        targetCFrame.Position + Vector3.new(0, 10, 0),
+        Vector3.new(0, -50, 0),
+        worldParams
+    )
+
+    return {
+        target = targetCFrame,
+        playerRoot = root and root.CFrame or nil,
+        playerDistance = root and (root.Position - targetCFrame.Position).Magnitude or nil,
+        humanoidState = humanoid and humanoid:GetState() or nil,
+        floorMaterial = humanoid and humanoid.FloorMaterial or nil,
+        grassHit = grassHit and grassHit.Instance or nil,
+        grassPosition = grassHit and grassHit.Position or nil,
+        grassGap = grassHit and (targetCFrame.Position.Y - grassHit.Position.Y) or nil,
+        worldHit = worldHit and worldHit.Instance or nil,
+        worldPosition = worldHit and worldHit.Position or nil,
+        worldGap = worldHit and (targetCFrame.Position.Y - worldHit.Position.Y) or nil,
+        worldNormal = worldHit and worldHit.Normal or nil,
+        allowedGrassCount = #allowedGrass,
+        lastPreview = lastPreview,
+        lastPreviewState = lastPreviewState
+    }
+end
+
+local function evaluatePreview(model)
+    if not model or not model.Parent then
+        return nil
+    end
+
+    local hitbox = model:FindFirstChild("Hitbox", true)
+    if not hitbox or not hitbox:IsA("BasePart") then
+        return nil
+    end
+
+    local overlapParams = OverlapParams.new()
+    overlapParams.FilterDescendantsInstances = {model}
+    local obstacles = {}
+
+    local success, touching = pcall(
+        Workspace.GetPartsInPart,
+        Workspace,
+        hitbox,
+        overlapParams
+    )
+
+    if success then
+        for _, part in ipairs(touching) do
+            if part.Transparency ~= 1 and part.CanQuery and part.Name ~= "Grass" then
+                table.insert(obstacles, part)
+            end
+        end
+    end
+
+    local grassParams = RaycastParams.new()
+    grassParams.FilterType = Enum.RaycastFilterType.Include
+    grassParams.FilterDescendantsInstances = getAllowedGrass()
+    local pivot = model:GetPivot()
+    local grassHit = Workspace:Raycast(
+        pivot.Position + Vector3.new(0, 10, 0),
+        Vector3.new(0, -50, 0),
+        grassParams
+    )
+
+    local obstaclePaths = {}
+    for _, obstacle in ipairs(obstacles) do
+        table.insert(obstaclePaths, safeFullName(obstacle))
+    end
+
+    return {
+        valid = #obstacles == 0 and grassHit ~= nil,
+        pivot = pivot,
+        hitboxCFrame = hitbox.CFrame,
+        hitboxSize = hitbox.Size,
+        obstacles = obstaclePaths,
+        grassHit = grassHit and grassHit.Instance or nil,
+        grassPosition = grassHit and grassHit.Position or nil,
+        indicatorColor = hitbox.Color,
+        indicatorTransparency = hitbox.Transparency
+    }
+end
+
+local knownModelNames = {
+    Turret = true,
+    TurretFirstLevel = true,
+    Spinner = true,
+    SpinnerFirstLevel = true,
+    Booster = true,
+    BoosterFirstLevel = true,
+    Grabber = true,
+    GrabberFirstLevel = true,
+    Stomper = true,
+    StomperFirstLevel = true
+}
+
+local function isEngineerModel(model)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+
+    return knownModelNames[model.Name]
+        or model:GetAttribute("IsSentry") == true
+        or model:GetAttribute("OwnerId") ~= nil
+        or CollectionService:HasTag(model, "Sentry")
+        or model:FindFirstChild("TurretStandBase", true) ~= nil
+end
+
+local function classifyModel(model)
+    local ownerId = model:GetAttribute("OwnerId")
+    local serverMarkers = ownerId ~= nil
+        or model:GetAttribute("IsSentry") == true
+        or CollectionService:HasTag(model, "Sentry")
+
+    if serverMarkers then
+        return "SERVER_SENTRY"
+    end
+
+    return "LOCAL_PREVIEW"
+end
+
+local function watchValueObject(object, model)
+    if not object:IsA("ValueBase") then
+        return
+    end
+
+    addConnection(object.Changed:Connect(function(value)
+        writeLine(
+            "SENTRY_VALUE_CHANGED",
+            "model=" .. safeFullName(model),
+            "path=" .. safeFullName(object),
+            "value=" .. valueString(value)
+        )
+    end))
+end
+
+local function watchSound(object, model)
+    if not object:IsA("Sound") then
+        return
+    end
+
+    addConnection(object.Played:Connect(function()
+        writeLine(
+            "SENTRY_SOUND_PLAYED",
+            "model=" .. safeFullName(model),
+            "sound=" .. safeFullName(object),
+            "soundId=" .. object.SoundId
+        )
+    end))
+
+    addConnection(object.Ended:Connect(function()
+        writeLine(
+            "SENTRY_SOUND_ENDED",
+            "model=" .. safeFullName(model),
+            "sound=" .. safeFullName(object)
+        )
+    end))
+end
+
+local function watchTouchPart(object, model)
+    if not object:IsA("BasePart") then
+        return
+    end
+
+    if object.Name ~= "Hitbox" and object.Name ~= "Glove" then
+        return
+    end
+
+    addConnection(object.Touched:Connect(function(otherPart)
+        writeLine(
+            "SENTRY_TOUCHED",
+            "model=" .. safeFullName(model),
+            "sensor=" .. safeFullName(object),
+            "other=" .. safeFullName(otherPart)
+        )
+    end))
+end
+
+local function correlateServerModel(model)
+    if not lastSentryCall then
+        return
+    end
+
+    if lastSentryCall.acceptedModel then
+        return
+    end
+
+    if elapsed() - lastSentryCall.time > 5 then
+        return
+    end
+
+    lastSentryCall.acceptedModel = model
+    local actualPivot = model:GetPivot()
+    local requested = lastSentryCall.cframe
+
+    writeLine(
+        "SERVER_DECISION_ACCEPTED",
+        "remote=" .. safeFullName(lastSentryCall.remote),
+        "requested=" .. valueString(requested),
+        "actual=" .. valueString(actualPivot),
+        "positionError=" .. tostring((actualPivot.Position - requested.Position).Magnitude),
+        "model=" .. safeFullName(model)
+    )
+end
+
+local function watchEngineerModel(model)
+    if watchedModels[model] then
+        return
+    end
+
+    watchedModels[model] = true
+    task.wait(0.05)
+
+    if not model.Parent or not isEngineerModel(model) then
+        watchedModels[model] = nil
+        return
+    end
+
+    local kind = classifyModel(model)
+    writeLine(
+        "ENGINEER_MODEL_ADDED",
+        "kind=" .. kind,
+        "path=" .. safeFullName(model),
+        "pivot=" .. valueString(model:GetPivot()),
+        "attributes=" .. attributesString(model),
+        "tags=" .. tagsString(model)
+    )
+
+    if kind == "LOCAL_PREVIEW" then
+        lastPreview = model
+    else
+        correlateServerModel(model)
+    end
+
+    for _, object in ipairs(model:GetDescendants()) do
+        watchValueObject(object, model)
+        watchSound(object, model)
+        watchTouchPart(object, model)
+    end
+
+    addConnection(model.DescendantAdded:Connect(function(object)
+        writeLine(
+            "SENTRY_DESCENDANT_ADDED",
+            "model=" .. safeFullName(model),
+            "path=" .. safeFullName(object),
+            "class=" .. object.ClassName,
+            "properties=" .. instanceProperties(object)
+        )
+        watchValueObject(object, model)
+        watchSound(object, model)
+        watchTouchPart(object, model)
+    end))
+
+    addConnection(model.DescendantRemoving:Connect(function(object)
+        writeLine(
+            "SENTRY_DESCENDANT_REMOVING",
+            "model=" .. safeFullName(model),
+            "path=" .. safeFullName(object),
+            "class=" .. object.ClassName
+        )
+    end))
+
+    addConnection(model.AttributeChanged:Connect(function(attribute)
+        writeLine(
+            "SENTRY_ATTRIBUTE_CHANGED",
+            "model=" .. safeFullName(model),
+            "attribute=" .. attribute,
+            "value=" .. valueString(model:GetAttribute(attribute)),
+            "attributes=" .. attributesString(model)
+        )
+
+        if classifyModel(model) == "SERVER_SENTRY" then
+            correlateServerModel(model)
+        end
+    end))
+
+    addConnection(model.AncestryChanged:Connect(function(_, parent)
+        if parent == nil then
+            writeLine(
+                "ENGINEER_MODEL_REMOVED",
+                "kind=" .. kind,
+                "path=" .. model.Name
+            )
+
+            if lastPreview == model then
+                lastPreview = nil
+            end
+        end
+    end))
+
+    task.spawn(function()
+        local lastPivot
+        local lastValidity
+        local lastOwnership
+
+        while not stopped and model.Parent do
+            local pivot = model:GetPivot()
+            local shouldLogPivot = not lastPivot
+                or (pivot.Position - lastPivot.Position).Magnitude > 0.05
+                or pivot.LookVector:Dot(lastPivot.LookVector) < 0.999
+
+            if shouldLogPivot then
+                writeLine(
+                    "ENGINEER_MODEL_PIVOT",
+                    "kind=" .. classifyModel(model),
+                    "model=" .. safeFullName(model),
+                    "pivot=" .. valueString(pivot)
+                )
+                lastPivot = pivot
+            end
+
+            if classifyModel(model) == "LOCAL_PREVIEW" then
+                local state = evaluatePreview(model)
+
+                if state then
+                    lastPreviewState = state
+
+                    if lastValidity ~= state.valid then
+                        writeLine(
+                            "PREVIEW_VALIDITY_CHANGED",
+                            "valid=" .. tostring(state.valid),
+                            "pivot=" .. valueString(state.pivot),
+                            "hitboxCFrame=" .. valueString(state.hitboxCFrame),
+                            "hitboxSize=" .. valueString(state.hitboxSize),
+                            "obstacles=" .. valueString(state.obstacles),
+                            "grassHit=" .. valueString(state.grassHit),
+                            "grassPosition=" .. valueString(state.grassPosition),
+                            "indicatorColor=" .. valueString(state.indicatorColor)
+                        )
+                        lastValidity = state.valid
+                    end
+                end
+            else
+                local base = model:FindFirstChild("TurretStandBase", true)
+
+                if base and base:IsA("BasePart") then
+                    local ownerFunction = rawget(ENV, "isnetworkowner") or _G.isnetworkowner
+                    local owned = "unavailable"
+
+                    if type(ownerFunction) == "function" then
+                        local success, result = pcall(ownerFunction, base)
+                        owned = success and result or "error"
+                    end
+
+                    if lastOwnership ~= owned then
+                        writeLine(
+                            "SENTRY_NETWORK_STATE",
+                            "model=" .. safeFullName(model),
+                            "base=" .. safeFullName(base),
+                            "isNetworkOwner=" .. tostring(owned),
+                            "anchored=" .. tostring(base.Anchored),
+                            "assemblyRoot=" .. valueString(base.AssemblyRootPart),
+                            "receiveAge=" .. valueString(safeProperty(base, "ReceiveAge")),
+                            "linearVelocity=" .. valueString(base.AssemblyLinearVelocity),
+                            "angularVelocity=" .. valueString(base.AssemblyAngularVelocity)
+                        )
+                        lastOwnership = owned
+                    end
+                end
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function describeArguments(arguments)
+    local result = {}
+
+    for index = 1, arguments.n or #arguments do
+        table.insert(
+            result,
+            "Arg[" .. index .. "]=" .. valueString(arguments[index])
+        )
+    end
+
+    return table.concat(result, " | ")
+end
+
+local watchedRemotes = {}
+
+local function addWatchedRemote(remote, label)
+    if remote then
+        watchedRemotes[remote] = label
+        writeLine(
+            "REMOTE_REGISTERED",
+            "label=" .. label,
+            "path=" .. safeFullName(remote),
+            "class=" .. remote.ClassName,
+            "attributes=" .. attributesString(remote)
+        )
+    else
+        writeLine("REMOTE_MISSING", label)
+    end
+end
+
+local Events = ReplicatedStorage:FindFirstChild("Events")
+addWatchedRemote(ReplicatedStorage:FindFirstChild("Sentry"), "Sentry")
+addWatchedRemote(ReplicatedStorage:FindFirstChild("engiehit"), "engiehit")
+addWatchedRemote(Events and Events:FindFirstChild("MasteredSentry"), "MasteredSentry")
+addWatchedRemote(Events and Events:FindFirstChild("MEngineerR"), "MEngineerR")
+
+local function recordRemote(remote, method, arguments, caller)
+    if stopped then
+        return
+    end
+
+    local label = watchedRemotes[remote] or remote.Name
+    local character, root, humanoid = getCharacter()
+
+    writeLine(
+        "REMOTE_CALL",
+        "label=" .. label,
+        "path=" .. safeFullName(remote),
+        "method=" .. method,
+        "caller=" .. valueString(caller),
+        "args=" .. describeArguments(arguments),
+        "character=" .. valueString(character),
+        "rootCFrame=" .. valueString(root and root.CFrame or nil),
+        "humanoidState=" .. valueString(humanoid and humanoid:GetState() or nil),
+        "floorMaterial=" .. valueString(humanoid and humanoid.FloorMaterial or nil)
+    )
+
+    if (label == "Sentry" or label == "MasteredSentry")
+        and typeof(arguments[1]) == "CFrame" then
+
+        local evaluation = evaluatePlacementCFrame(arguments[1])
+        writeLine("PLACEMENT_REQUEST_EVALUATION", evaluation)
+
+        lastSentryCall = {
+            time = elapsed(),
+            remote = remote,
+            cframe = arguments[1],
+            arguments = arguments,
+            acceptedModel = nil
+        }
+
+        task.delay(5, function()
+            if lastSentryCall
+                and lastSentryCall.remote == remote
+                and lastSentryCall.cframe == arguments[1]
+                and not lastSentryCall.acceptedModel then
+
+                writeLine(
+                    "SERVER_DECISION_REJECTED_OR_NO_MODEL",
+                    "remote=" .. safeFullName(remote),
+                    "requested=" .. valueString(arguments[1]),
+                    "note=no server-tagged sentry appeared within 5 seconds"
+                )
+            end
+        end)
+    end
+
+    flush()
+end
+
+if type(hookmetamethod) == "function"
+    and type(getnamecallmethod) == "function"
+    and type(newcclosure) == "function" then
+
+    local success, original = pcall(function()
+        local old
+        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+
+            if method == "FireServer" and watchedRemotes[self] then
+                local arguments = table.pack(...)
+                local caller
+
+                if type(getcallingscript) == "function" then
+                    local callerSuccess, callerResult = pcall(getcallingscript)
+                    if callerSuccess then
+                        caller = callerResult
+                    end
+                end
+
+                task.defer(recordRemote, self, method, arguments, caller)
+            end
+
+            return old(self, ...)
+        end))
+        return old
+    end)
+
+    if success and type(original) == "function" then
+        oldNamecall = original
+        hookInstalled = true
+        writeLine("REMOTE_HOOK", "installed=true", "mode=pass-through exact remotes only")
+    else
+        writeLine("REMOTE_HOOK", "installed=false", "error=" .. tostring(original))
+    end
+else
+    writeLine("REMOTE_HOOK", "installed=false", "reason=capability missing")
+end
+
+local function dumpSignal(signal, label)
+    if type(getconnections) ~= "function" then
+        writeLine("SIGNAL_CONNECTIONS", label, "getconnections unavailable")
+        return
+    end
+
+    local success, signalConnections = pcall(getconnections, signal)
+
+    if not success then
+        writeLine("SIGNAL_CONNECTIONS", label, "error=" .. tostring(signalConnections))
+        return
+    end
+
+    writeLine("SIGNAL_CONNECTIONS", label, "count=" .. #signalConnections)
+
+    for index, connection in ipairs(signalConnections) do
+        local fn = connection.Function
+        writeLine(
+            "SIGNAL_CONNECTION",
+            "label=" .. label,
+            "index=" .. index,
+            "enabled=" .. tostring(connection.Enabled),
+            "luaConnection=" .. tostring(connection.LuaConnection),
+            "function=" .. valueString(fn)
+        )
+    end
+end
+
+local function dumpEngineerConnections()
+    local tool = findEngineerTool()
+
+    if not tool then
+        writeLine("CONNECTION_DUMP", "Engineer tool missing")
+        return
+    end
+
+    dumpSignal(tool.Equipped, safeFullName(tool) .. ".Equipped")
+    dumpSignal(tool.Unequipped, safeFullName(tool) .. ".Unequipped")
+    dumpSignal(tool.Activated, safeFullName(tool) .. ".Activated")
+
+    local glove = tool:FindFirstChild("Glove")
+    if glove and glove:IsA("BasePart") then
+        dumpSignal(glove.Touched, safeFullName(glove) .. ".Touched")
+    end
+
+    if Events then
+        local switched = Events:FindFirstChild("onSentrySwitched")
+        if switched and switched:IsA("RemoteEvent") then
+            dumpSignal(
+                switched.OnClientEvent,
+                safeFullName(switched) .. ".OnClientEvent"
+            )
+        end
+    end
+end
+
+local function dumpFunctionDetails(fn, index, reason)
+    writeLine(
+        "ENGINEER_FUNCTION",
+        "index=" .. index,
+        "reason=" .. reason,
+        "info=" .. valueString(fn)
+    )
+
+    if debug and type(debug.getconstants) == "function" then
+        local success, constants = pcall(debug.getconstants, fn)
+        if success then
+            writeLine(
+                "FUNCTION_CONSTANTS",
+                "index=" .. index,
+                "values=" .. valueString(constants)
+            )
+        end
+    end
+
+    if debug and type(debug.getupvalues) == "function" then
+        local success, upvalues = pcall(debug.getupvalues, fn)
+
+        if success then
+            for upvalueIndex, upvalue in pairs(upvalues) do
+                writeLine(
+                    "FUNCTION_UPVALUE",
+                    "functionIndex=" .. index,
+                    "upvalueIndex=" .. tostring(upvalueIndex),
+                    "type=" .. typeof(upvalue),
+                    "value=" .. valueString(upvalue)
+                )
+            end
+        end
+    end
+
+    if debug and type(debug.getprotos) == "function" then
+        local success, protos = pcall(debug.getprotos, fn)
+        if success then
+            writeLine(
+                "FUNCTION_PROTOS",
+                "functionIndex=" .. index,
+                "count=" .. #protos
+            )
+        end
+    end
+end
+
+local function dumpEngineerClosures(reason)
+    writeLine("BEGIN_CLOSURE_DUMP", reason)
+
+    if type(getgc) ~= "function" then
+        writeLine("CLOSURE_DUMP", "getgc unavailable")
+        return
+    end
+
+    local engineerScript = findEngineerScript()
+    local success, objects = pcall(getgc, true)
+
+    if not success then
+        writeLine("CLOSURE_DUMP", "getgc error=" .. tostring(objects))
+        return
+    end
+
+    local matched = 0
+
+    for _, object in ipairs(objects) do
+        if type(object) == "function" then
+            local match = false
+            local reasonText = ""
+
+            if type(getfenv) == "function" then
+                local envSuccess, functionEnv = pcall(getfenv, object)
+
+                if envSuccess and type(functionEnv) == "table" then
+                    local ownerScript = rawget(functionEnv, "script")
+
+                    if engineerScript and ownerScript == engineerScript then
+                        match = true
+                        reasonText = "getfenv.script"
+                    elseif typeof(ownerScript) == "Instance"
+                        and string.find(
+                            string.lower(safeFullName(ownerScript)),
+                            "engineer",
+                            1,
+                            true
+                        ) then
+
+                        match = true
+                        reasonText = "engineer source path"
+                    end
+                end
+            end
+
+            if not match and debug and type(debug.info) == "function" then
+                local infoSuccess, source = pcall(debug.info, object, "s")
+
+                if infoSuccess
+                    and string.find(
+                        string.lower(tostring(source)),
+                        "engineer",
+                        1,
+                        true
+                    ) then
+
+                    match = true
+                    reasonText = "debug source"
+                end
+            end
+
+            if match then
+                matched += 1
+                dumpFunctionDetails(object, matched, reasonText)
+                task.wait()
+            end
+        end
+    end
+
+    writeLine("END_CLOSURE_DUMP", reason, "matched=" .. matched)
+end
+
+local function addSourceCandidate(candidates, seen, object)
+    if not object
+        or seen[object]
+        or not object:IsA("LuaSourceContainer") then
+
+        return
+    end
+
+    seen[object] = true
+    table.insert(candidates, object)
+end
+
+local function resolvePath(root, names)
+    local object = root
+
+    for _, name in ipairs(names) do
+        object = object and object:FindFirstChild(name)
+    end
+
+    return object
+end
+
+local function dumpRelevantSources()
+    writeLine("BEGIN_SOURCE_DUMP")
+
+    if type(decompile) ~= "function" then
+        writeLine("SOURCE_DUMP", "decompile unavailable")
+        return
+    end
+
+    local candidates = {}
+    local seen = {}
+    local tool = findEngineerTool()
+
+    if tool then
+        for _, object in ipairs(tool:GetDescendants()) do
+            addSourceCandidate(candidates, seen, object)
+        end
+    end
+
+    for _, object in ipairs({
+        ReplicatedStorage:FindFirstChild("CooldownModule"),
+        resolvePath(ReplicatedFirst, {"Dependencies", "GloveCommonClient"}),
+        resolvePath(ReplicatedFirst, {"Dependencies", "GloveMasteryClient"})
+    }) do
+        addSourceCandidate(candidates, seen, object)
+    end
+
+    if type(getloadedmodules) == "function" then
+        local success, loaded = pcall(getloadedmodules)
+
+        if success then
+            for _, module in ipairs(loaded) do
+                local path = string.lower(safeFullName(module))
+                local unrelatedSentrySdk = string.find(
+                    path,
+                    "sentrysdk",
+                    1,
+                    true
+                ) ~= nil
+                    or string.find(path, "corepackages", 1, true) ~= nil
+
+                if not unrelatedSentrySdk
+                    and (string.find(path, "engineer", 1, true)
+                        or string.find(path, "sentry", 1, true)) then
+
+                    addSourceCandidate(candidates, seen, module)
+                end
+            end
+        end
+    end
+
+    writeLine("SOURCE_CANDIDATES", "count=" .. #candidates)
+
+    for index, sourceObject in ipairs(candidates) do
+        writeLine(
+            "SOURCE_BEGIN",
+            "index=" .. index,
+            "path=" .. safeFullName(sourceObject),
+            "class=" .. sourceObject.ClassName
+        )
+
+        if type(getscriptbytecode) == "function" then
+            local byteSuccess, bytecode = pcall(getscriptbytecode, sourceObject)
+            writeLine(
+                "SOURCE_BYTECODE",
+                "index=" .. index,
+                "success=" .. tostring(byteSuccess),
+                "bytes=" .. tostring(byteSuccess and #bytecode or 0)
+            )
+        end
+
+        local success, source = pcall(decompile, sourceObject)
+
+        if success then
+            writeRawBlock(
+                "SOURCE_" .. index .. "_" .. sourceObject.Name,
+                source
+            )
+        else
+            writeLine(
+                "SOURCE_ERROR",
+                "index=" .. index,
+                "error=" .. tostring(source)
+            )
+        end
+
+        task.wait()
+    end
+
+    writeLine("END_SOURCE_DUMP")
+end
+
+local function dumpMasteryAndDatabase()
+    writeLine("BEGIN_ENGINEER_DATABASE")
+
+    local commonGloves = resolvePath(
+        ReplicatedStorage,
+        {"Common", "Gloves"}
+    )
+
+    if commonGloves and commonGloves:IsA("ModuleScript") then
+        local success, database = pcall(require, commonGloves)
+
+        if success and type(database) == "table" then
+            writeLine("ENGINEER_DATABASE", valueString(database.Engineer))
+        else
+            writeLine("ENGINEER_DATABASE_ERROR", database)
+        end
+    end
+
+    local playerDataRoot = ReplicatedStorage:FindFirstChild("PlayerData")
+    local playerData = playerDataRoot and playerDataRoot:FindFirstChild(LocalPlayer.Name)
+
+    if playerData then
+        for _, object in ipairs(playerData:GetDescendants()) do
+            local lowerName = string.lower(object.Name)
+
+            if string.find(lowerName, "master", 1, true)
+                or string.find(lowerName, "glove", 1, true)
+                or string.find(lowerName, "slap", 1, true) then
+
+                if object:IsA("ValueBase") then
+                    local decodedEngineer
+
+                    if typeof(object.Value) == "string" then
+                        local decodeSuccess, decoded = pcall(
+                            HttpService.JSONDecode,
+                            HttpService,
+                            object.Value
+                        )
+
+                        if decodeSuccess and type(decoded) == "table" then
+                            decodedEngineer = decoded.Engineer
+                        end
+                    end
+
+                    writeLine(
+                        "PLAYERDATA_ENGINEER_RELATED",
+                        "path=" .. safeFullName(object),
+                        "value=" .. valueString(object.Value),
+                        "decodedEngineer=" .. valueString(decodedEngineer),
+                        "attributes=" .. attributesString(object)
+                    )
+
+                    if not watchedPlayerDataValues[object] then
+                        watchedPlayerDataValues[object] = true
+
+                        addConnection(object.Changed:Connect(function(value)
+                            local changedEngineer
+
+                            if typeof(value) == "string" then
+                                local changedSuccess, changedDecoded = pcall(
+                                    HttpService.JSONDecode,
+                                    HttpService,
+                                    value
+                                )
+
+                                if changedSuccess and type(changedDecoded) == "table" then
+                                    changedEngineer = changedDecoded.Engineer
+                                end
+                            end
+
+                            writeLine(
+                                "PLAYERDATA_ENGINEER_CHANGED",
+                                "path=" .. safeFullName(object),
+                                "decodedEngineer=" .. valueString(changedEngineer),
+                                "fullValue=" .. valueString(value)
+                            )
+                        end))
+                    end
+                end
+            end
+        end
+    end
+
+    writeLine("END_ENGINEER_DATABASE")
+end
+
+local function dumpContextActions()
+    local success, actions = pcall(
+        ContextActionService.GetAllBoundActionInfo,
+        ContextActionService
+    )
+
+    writeLine(
+        "CONTEXT_ACTIONS",
+        "success=" .. tostring(success),
+        "actions=" .. valueString(success and actions or {})
+    )
+end
+
+local function snapshot(reason)
+    writeLine("BEGIN_SNAPSHOT", reason)
+
+    local character, root, humanoid = getCharacter()
+    local tool = findEngineerTool()
+
+    writeLine(
+        "PLAYER_STATE",
+        "Glove=" .. valueString(LocalPlayer:GetAttribute("Glove")),
+        "attributes=" .. attributesString(LocalPlayer),
+        "character=" .. valueString(character),
+        "characterAttributes=" .. (character and attributesString(character) or "{}"),
+        "rootCFrame=" .. valueString(root and root.CFrame or nil),
+        "rootVelocity=" .. valueString(root and root.AssemblyLinearVelocity or nil),
+        "humanoidState=" .. valueString(humanoid and humanoid:GetState() or nil),
+        "floorMaterial=" .. valueString(humanoid and humanoid.FloorMaterial or nil),
+        "tool=" .. valueString(tool)
+    )
+
+    if character then
+        for _, name in ipairs({"isInArena", "Ragdolled", "entered", "regulararena"}) do
+            local object = character:FindFirstChild(name)
+            writeLine(
+                "CHARACTER_VALUE",
+                "name=" .. name,
+                "value=" .. valueString(object and object.Value or nil)
+            )
+        end
+    end
+
+    local grass = getAllowedGrass()
+    writeLine("ALLOWED_GRASS", "count=" .. #grass)
+
+    for index, part in ipairs(grass) do
+        writeLine(
+            "ALLOWED_GRASS_PART",
+            "index=" .. index,
+            "path=" .. safeFullName(part),
+            "properties=" .. instanceProperties(part)
+        )
+    end
+
+    for model in pairs(watchedModels) do
+        if model.Parent then
+            writeLine(
+                "CURRENT_ENGINEER_MODEL",
+                "kind=" .. classifyModel(model),
+                "path=" .. safeFullName(model),
+                "pivot=" .. valueString(model:GetPivot()),
+                "attributes=" .. attributesString(model),
+                "tags=" .. tagsString(model)
+            )
+        end
+    end
+
+    dumpContextActions()
+    dumpEngineerConnections()
+    dumpEngineerClosures(reason)
+    flush()
+    writeLine("END_SNAPSHOT", reason)
+end
+
+local function attachCharacter(character)
+    writeLine(
+        "CHARACTER_ATTACHED",
+        "path=" .. safeFullName(character),
+        "attributes=" .. attributesString(character)
+    )
+
+    addConnection(character.AttributeChanged:Connect(function(attribute)
+        writeLine(
+            "CHARACTER_ATTRIBUTE_CHANGED",
+            "attribute=" .. attribute,
+            "value=" .. valueString(character:GetAttribute(attribute))
+        )
+    end))
+
+    addConnection(character.ChildAdded:Connect(function(object)
+        if object:IsA("ValueBase")
+            or object:IsA("Tool")
+            or object.Name == "HumanoidRootPart" then
+
+            writeLine(
+                "CHARACTER_CHILD_ADDED",
+                "path=" .. safeFullName(object),
+                "class=" .. object.ClassName,
+                "properties=" .. instanceProperties(object)
+            )
+        end
+    end))
+
+    addConnection(character.ChildRemoved:Connect(function(object)
+        if object:IsA("ValueBase") or object:IsA("Tool") then
+            writeLine(
+                "CHARACTER_CHILD_REMOVED",
+                "name=" .. object.Name,
+                "class=" .. object.ClassName
+            )
+        end
+    end))
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+        or character:WaitForChild("Humanoid", 10)
+
+    if humanoid then
+        addConnection(humanoid.StateChanged:Connect(function(oldState, newState)
+            writeLine(
+                "HUMANOID_STATE_CHANGED",
+                "old=" .. tostring(oldState),
+                "new=" .. tostring(newState),
+                "floorMaterial=" .. tostring(humanoid.FloorMaterial)
+            )
+        end))
+
+        addConnection(humanoid.Died:Connect(function()
+            writeLine("HUMANOID_DIED")
+            flush()
+        end))
+    end
+end
+
+addConnection(LocalPlayer.AttributeChanged:Connect(function(attribute)
+    writeLine(
+        "PLAYER_ATTRIBUTE_CHANGED",
+        "attribute=" .. attribute,
+        "value=" .. valueString(LocalPlayer:GetAttribute(attribute))
+    )
+end))
+
+addConnection(LocalPlayer.CharacterAdded:Connect(attachCharacter))
+
+if LocalPlayer.Character then
+    task.spawn(attachCharacter, LocalPlayer.Character)
+end
+
+local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+local slaps = leaderstats and leaderstats:FindFirstChild("Slaps")
+
+if slaps and slaps:IsA("ValueBase") then
+    addConnection(slaps.Changed:Connect(function(value)
+        writeLine("SLAPS_CHANGED", "value=" .. tostring(value))
+    end))
+end
+
+addConnection(UserInputService.InputBegan:Connect(function(input, processed)
+    if input.KeyCode == Enum.KeyCode.E
+        or input.KeyCode == Enum.KeyCode.ButtonR2
+        or input.KeyCode == Enum.KeyCode.ButtonL2 then
+
+        writeLine(
+            "ABILITY_INPUT_BEGIN",
+            "keyCode=" .. tostring(input.KeyCode),
+            "inputType=" .. tostring(input.UserInputType),
+            "processed=" .. tostring(processed)
+        )
+    end
+end))
+
+addConnection(UserInputService.InputEnded:Connect(function(input, processed)
+    if input.KeyCode == Enum.KeyCode.E
+        or input.KeyCode == Enum.KeyCode.ButtonR2
+        or input.KeyCode == Enum.KeyCode.ButtonL2 then
+
+        writeLine(
+            "ABILITY_INPUT_END",
+            "keyCode=" .. tostring(input.KeyCode),
+            "inputType=" .. tostring(input.UserInputType),
+            "processed=" .. tostring(processed)
+        )
+    end
+end))
+
+addConnection(Workspace.ChildAdded:Connect(function(object)
+    if object:IsA("Model") then
+        task.spawn(watchEngineerModel, object)
+    end
+end))
+
+for _, object in ipairs(Workspace:GetChildren()) do
+    if object:IsA("Model") and isEngineerModel(object) then
+        task.spawn(watchEngineerModel, object)
+    end
+end
+
+addConnection(CollectionService:GetInstanceAddedSignal("Sentry"):Connect(function(object)
+    writeLine(
+        "SENTRY_TAG_ADDED",
+        "path=" .. safeFullName(object),
+        "attributes=" .. attributesString(object)
+    )
+
+    if object:IsA("Model") then
+        task.spawn(watchEngineerModel, object)
+        correlateServerModel(object)
+    end
+end))
+
+addConnection(CollectionService:GetInstanceRemovedSignal("Sentry"):Connect(function(object)
+    writeLine("SENTRY_TAG_REMOVED", "path=" .. safeFullName(object))
+end))
+
+if Events then
+    local switched = Events:FindFirstChild("onSentrySwitched")
+
+    if switched and switched:IsA("RemoteEvent") then
+        addConnection(switched.OnClientEvent:Connect(function(...)
+            local arguments = table.pack(...)
+            writeLine(
+                "SENTRY_SWITCHED_FROM_SERVER",
+                "args=" .. describeArguments(arguments)
+            )
+        end))
+    end
+end
+
+local errorSuccess, errorConnection = pcall(function()
+    return ScriptContext.Error:Connect(function(message, stackTrace, sourceScript)
+        writeLine(
+            "RUNTIME_ERROR",
+            "message=" .. tostring(message),
+            "script=" .. valueString(sourceScript),
+            "stack=" .. tostring(stackTrace)
+        )
+        flush()
+    end)
+end)
+
+if errorSuccess then
+    addConnection(errorConnection)
+else
+    writeLine("ERROR_CAPTURE", "installed=false", "reason=" .. tostring(errorConnection))
+end
+
+task.spawn(function()
+    while not stopped do
+        task.wait(1)
+        flush()
+    end
+end)
+
+-- GUI
+
+local oldGui = CoreGui:FindFirstChild("SB_EngineerDeepCollector")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "SB_EngineerDeepCollector"
+Gui.ResetOnSpawn = false
+Gui.IgnoreGuiInset = true
+
+local guiParent = CoreGui
+
+if type(gethui) == "function" then
+    pcall(function()
+        guiParent = gethui()
+    end)
+end
+
+if type(protectgui) == "function" then
+    pcall(protectgui, Gui)
+end
+
+Gui.Parent = guiParent
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.fromOffset(570, 440)
+Main.Position = UDim2.new(0.5, -285, 0.5, -220)
+Main.BackgroundColor3 = Color3.fromRGB(20, 23, 30)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = Gui
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 36)
+Title.BackgroundColor3 = Color3.fromRGB(34, 39, 50)
+Title.TextColor3 = Color3.new(1, 1, 1)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 15
+Title.Text = "ENGINEER DEEP COLLECTOR V1"
+Title.Parent = Main
+
+StatusLabel = Instance.new("TextLabel")
+StatusLabel.Position = UDim2.fromOffset(8, 39)
+StatusLabel.Size = UDim2.new(1, -16, 0, 24)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.TextColor3 = Color3.fromRGB(255, 207, 75)
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.TextSize = 12
+StatusLabel.Text = "Collecting static Engineer data — wait"
+StatusLabel.Parent = Main
+
+local Buttons = Instance.new("Frame")
+Buttons.Position = UDim2.fromOffset(8, 66)
+Buttons.Size = UDim2.new(1, -16, 0, 74)
+Buttons.BackgroundTransparency = 1
+Buttons.Parent = Main
+
+local Grid = Instance.new("UIGridLayout")
+Grid.CellSize = UDim2.new(0.25, -6, 0, 32)
+Grid.CellPadding = UDim2.fromOffset(7, 6)
+Grid.Parent = Buttons
+
+local function makeButton(text, color, callback)
+    local button = Instance.new("TextButton")
+    button.BackgroundColor3 = color
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 11
+    button.Text = text
+    button.Parent = Buttons
+    button.MouseButton1Click:Connect(callback)
+    return button
+end
+
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Position = UDim2.fromOffset(8, 146)
+Scroll.Size = UDim2.new(1, -16, 1, -154)
+Scroll.BackgroundColor3 = Color3.fromRGB(11, 13, 18)
+Scroll.BorderSizePixel = 0
+Scroll.ScrollBarThickness = 6
+Scroll.CanvasSize = UDim2.fromOffset(0, 6000)
+Scroll.Parent = Main
+
+LogLabel = Instance.new("TextLabel")
+LogLabel.Position = UDim2.fromOffset(5, 5)
+LogLabel.Size = UDim2.new(1, -10, 0, 5980)
+LogLabel.BackgroundTransparency = 1
+LogLabel.TextColor3 = Color3.fromRGB(220, 225, 235)
+LogLabel.Font = Enum.Font.Code
+LogLabel.TextSize = 11
+LogLabel.TextXAlignment = Enum.TextXAlignment.Left
+LogLabel.TextYAlignment = Enum.TextYAlignment.Top
+LogLabel.TextWrapped = false
+LogLabel.Text = ""
+LogLabel.Parent = Scroll
+
+local function copyReport()
+    flush()
+    local reportText
+
+    if HAS_READFILE and HAS_WRITEFILE then
+        local success, content = pcall(readfile, FILE_NAME)
+        if success then
+            reportText = content
+        end
+    end
+
+    reportText = reportText or fallbackFile .. table.concat(pendingLines, "\n")
+
+    local clipboard = setclipboard or toclipboard
+    if type(clipboard) == "function" then
+        local success, errorMessage = pcall(clipboard, reportText)
+        writeLine(
+            "COPY_RESULT",
+            "success=" .. tostring(success),
+            "bytes=" .. #reportText,
+            "error=" .. tostring(errorMessage)
+        )
+    else
+        writeLine("COPY_RESULT", "success=false", "clipboard unavailable")
+    end
+end
+
+local function stopCollector()
+    if stopped then
+        return
+    end
+
+    stopped = true
+    writeLine("END_REPORT", "reason=user stop")
+    flush()
+
+    for _, connection in ipairs(connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    if hookInstalled and oldNamecall and type(hookmetamethod) == "function" then
+        pcall(function()
+            hookmetamethod(game, "__namecall", oldNamecall)
+        end)
+    end
+
+    StatusLabel.Text = "STOPPED — saved: " .. FILE_NAME
+end
+
+ENV.SB_ENGINEER_DEEP_STOP = stopCollector
+
+makeButton("MARK / SNAPSHOT", Color3.fromRGB(55, 105, 165), function()
+    task.spawn(snapshot, "manual mark")
+end)
+
+makeButton("DUMP ASSETS", Color3.fromRGB(80, 90, 145), function()
+    task.spawn(function()
+        local assets = ReplicatedStorage:FindFirstChild("Assets")
+        dumpTree(assets and assets:FindFirstChild("Engineer"), "ENGINEER_ASSETS_MANUAL")
+        flush()
+    end)
+end)
+
+makeButton("DUMP SOURCES", Color3.fromRGB(105, 75, 145), function()
+    task.spawn(dumpRelevantSources)
+end)
+
+makeButton("COPY REPORT", Color3.fromRGB(40, 135, 145), copyReport)
+
+makeButton("CLOSURES NOW", Color3.fromRGB(145, 105, 45), function()
+    task.spawn(dumpEngineerClosures, "manual closure mark")
+end)
+
+makeButton("CONNECTIONS", Color3.fromRGB(110, 110, 65), function()
+    task.spawn(dumpEngineerConnections)
+end)
+
+makeButton("SAVE/FLUSH", Color3.fromRGB(50, 125, 75), function()
+    flush()
+    StatusLabel.Text = "Saved: " .. FILE_NAME
+end)
+
+makeButton("STOP", Color3.fromRGB(165, 55, 55), stopCollector)
+
+task.spawn(function()
+    StatusLabel.Text = "Static dump 1/4: Engineer assets"
+    local assets = ReplicatedStorage:FindFirstChild("Assets")
+    dumpTree(assets and assets:FindFirstChild("Engineer"), "ENGINEER_ASSETS")
+
+    StatusLabel.Text = "Static dump 2/4: Engineer tool"
+    dumpTree(findEngineerTool(), "CURRENT_ENGINEER_TOOL")
+
+    StatusLabel.Text = "Static dump 3/4: sources/database"
+    dumpMasteryAndDatabase()
+    dumpRelevantSources()
+
+    StatusLabel.Text = "Static dump 4/4: closures/connections"
+    dumpEngineerConnections()
+    dumpEngineerClosures("initial static dump")
+    snapshot("initial snapshot")
+    flush()
+
+    StatusLabel.Text = "READY — perform Engineer tests"
+    writeLine("COLLECTOR_READY", "file=" .. FILE_NAME)
+    flush()
+end)
